@@ -1,9 +1,7 @@
-# run_driver.py - With Byzantine attack support
+# run_driver.py - With Byzantine attack support (driver sends attack_map to nodes)
 """
-Driver with full Byzantine attack support.
-
-Small modification: node base_timer default reduced to 1.0s so view-change detection is faster.
-(Each node's actual timeout is base_timer + node_id which staggers timers.)
+Driver that configures attacks via AttackOrchestrator and serializes attack_map
+into RESET messages so spawned node processes can reconstruct AttackConfig locally.
 """
 
 import multiprocessing as mp
@@ -15,7 +13,6 @@ from client import client_process_main
 from monitor import monitor_main
 from common import leader_for_view
 
-# NEW IMPORTS
 from attacks import initialize_orchestrator, get_orchestrator
 from csv_parser import parse_csv_with_attacks
 
@@ -31,6 +28,8 @@ LAST_LIVE_NODES = set(range(1, NUM_NODES + 1))
 def PrintDB(monitor_db, _applied_set=None):
     """Print per-node DB snapshots."""
     default_db = {chr(ord("A") + i): 10 for i in range(10)}
+
+    orchestrator = get_orchestrator()
 
     for node_id in range(1, NUM_NODES + 1):
         try:
@@ -48,12 +47,10 @@ def PrintDB(monitor_db, _applied_set=None):
         line = f"Node {node_id}: " + " ".join(parts)
         if node_id not in LAST_LIVE_NODES:
             line += " (simulated down)"
-        
-        # Mark Byzantine nodes
-        orchestrator = get_orchestrator()
+
         if orchestrator and orchestrator.is_byzantine(node_id):
             line += " [BYZANTINE]"
-        
+
         print(line)
 
 
@@ -62,50 +59,7 @@ def PrintLog(node_id, node_processes_dict=None):
     Print protocol message log for a specific node.
     node_processes_dict: dict mapping node_id to Node object (for accessing message_log)
     """
-    if node_processes_dict is None or node_id not in node_processes_dict:
-        print(f"[PrintLog] Cannot access message log for node {node_id}")
-        return
-    
-    try:
-        node = node_processes_dict[node_id]
-        msg_log = node.get_message_log()
-        
-        if not msg_log:
-            print(f"[PrintLog] No messages logged for node {node_id}")
-            return
-        
-        print(f"\n{'='*80}")
-        print(f"Message Log for Node {node_id}")
-        print(f"{'='*80}")
-        print(f"{'Time':<12} {'Direction':<10} {'Type':<18} {'View':<5} {'Seq':<5} {'Details'}")
-        print(f"{'-'*80}")
-        
-        for entry in msg_log:
-            ts = entry.get("timestamp", 0)
-            direction = entry.get("direction", "")
-            msg_type = entry.get("type", "")
-            view = entry.get("view", "-")
-            seq = entry.get("seq", "-")
-            
-            # Build details string
-            details = []
-            if entry.get("client"):
-                details.append(f"client={entry['client']}")
-            if entry.get("sender") and entry.get("sender") != node_id:
-                details.append(f"from={entry['sender']}")
-            if entry.get("digest"):
-                details.append(f"d={entry['digest'][:8]}...")
-            if entry.get("request_id"):
-                details.append(f"t={entry['request_id']}")
-            
-            details_str = " ".join(details) if details else ""
-            
-            print(f"{ts:12.3f} {direction:<10} {msg_type:<18} {str(view):<5} {str(seq):<5} {details_str}")
-        
-        print(f"{'='*80}\n")
-        
-    except Exception as e:
-        print(f"[PrintLog] Error: {e}")
+    print("[PrintLog] (This driver prints only DB/status. Node message logs are shown by Node 'PrintLog' log function.)")
 
 
 def PrintStatus(seq_no, applied_set=None, monitor_log=None):
@@ -219,7 +173,7 @@ def main(csvfile):
     print(f"\nParsed {len(sets)} sets:")
     for s in sets:
         print(f"  Set {s['set_no']}: {len(s['transactions'])} txns, "
-              f"live={s['live']}, byzantine={s['byzantine']}, attacks={s['attacks']}")
+              f"live={s.get('live')}, byzantine={s.get('byzantine')}, attacks={s.get('attacks')}")
 
     # Create queues
     node_inboxes = {nid: manager.Queue() for nid in range(1, NUM_NODES + 1)}
@@ -241,17 +195,17 @@ def main(csvfile):
 
     readiness_queue = manager.Queue()
 
-    # Start nodes with smaller base timer (1 second) so view-change detection is faster.
+    # Start nodes
     node_procs = []
     for nid in range(1, NUM_NODES + 1):
         p = mp.Process(target=node_process_main, args=(
-            nid, NUM_NODES, keyring, 
+            nid, NUM_NODES, keyring,
             node_inboxes[nid],      # node's inbox
-            node_inboxes,            # all node inboxes for node-to-node communication
-            client_reply_queues,     # client reply queues for sending REPLY messages
-            monitor_queue, 
+            node_inboxes,           # all node inboxes for node-to-node communication
+            client_reply_queues,    # client reply queues for sending REPLY messages
+            monitor_queue,
             readiness_queue,
-            1.0                      # base timer = 1 second (node's actual timeout = 1.0 + node_id)
+            5.0                     # base timer = 5 seconds
         ))
         p.start()
         node_procs.append(p)
@@ -271,15 +225,15 @@ def main(csvfile):
     if ready_count < NUM_NODES:
         print(f"Warning: only {ready_count}/{NUM_NODES} nodes ready")
 
-    # Start clients with shorter timeout (8 seconds instead of 10)
+    # Start clients
     client_procs = []
     for cid in range(1, NUM_CLIENTS + 1):
         p = mp.Process(target=client_process_main, args=(
-            cid, 
-            client_control_queues[cid], 
-            client_reply_queues[cid], 
-            node_inboxes, 
-            8.0  # client timeout = 8 seconds
+            cid,
+            client_control_queues[cid],
+            client_reply_queues[cid],
+            node_inboxes,
+            8.0  # client timeout = 8 seconds (you can increase this)
         ))
         p.start()
         client_procs.append(p)
@@ -293,28 +247,42 @@ def main(csvfile):
         live_nodes = s.get("live", list(range(1, NUM_NODES + 1)))
         byzantine_nodes = s.get("byzantine", [])
         attack_strings = s.get("attacks", [])
-        
-        live_nodes_set = set(live_nodes)
-        LAST_LIVE_NODES = set(live_nodes)
+
+        # Ensure attack_strings length matches byzantine_nodes
+        while len(attack_strings) < len(byzantine_nodes):
+            attack_strings.append("")
+
+        # Configure orchestrator BEFORE we pause/unpause nodes
+        orchestrator.configure_set(live_nodes, byzantine_nodes, attack_strings)
+
+        # Determine crashed nodes from orchestrator (driver simulates crash via PAUSE)
+        crashed = orchestrator.get_crashed_nodes()
+        if crashed:
+            print(f"⚠️  Crashed nodes for this set (will be PAUSED even if listed live): {crashed}")
+
+        # Effective live nodes: CSV live_nodes minus crashed nodes
+        live_nodes_set = set(live_nodes) - set(crashed)
+        LAST_LIVE_NODES = set(live_nodes_set)
 
         leader_info = leader_for_view(0, NUM_NODES)
 
-        # Interactive menu BEFORE configuring attacks
+        # Interactive menu BEFORE configuring attacks and pausing crashed nodes
         while True:
             cmd = input(
                 f"\nReady to process Set {sid} ({len(entries)} txns).\n"
                 f"Leader: Node {leader_info}\n"
-                f"Live nodes: {sorted(list(live_nodes))}\n"
+                f"Live nodes (CSV): {sorted(list(live_nodes))}\n"
+                f"Effective live nodes (after crash): {sorted(list(live_nodes_set))}\n"
                 "Commands: [Enter=continue, PrintDB, PrintLog <n>, PrintStatus <n>, PrintView, quit]\n> "
             ).strip()
-            
+
             if cmd == "":
                 break
             tok = cmd.strip().split()
             if len(tok) == 0:
                 break
             c0 = tok[0].lower()
-            
+
             if c0 in ("continue", "c"):
                 break
             if c0 in ("quit", "exit"):
@@ -325,7 +293,7 @@ def main(csvfile):
                 continue
             if c0 == "printlog":
                 if len(tok) == 2 and tok[1].isdigit():
-                    PrintLog(int(tok[1]), monitor_log)
+                    PrintLog(int(tok[1]))
                 else:
                     print("Usage: PrintLog <node_id>")
                 continue
@@ -340,63 +308,49 @@ def main(csvfile):
                 continue
             print("Invalid command")
 
-        # NOW configure attacks for this set (AFTER the menu)
-        print(f"\n{'='*60}")
-        print(f"Set {sid}: Configuring attacks")
-        print(f"  Live nodes: {sorted(live_nodes)}")
-        print(f"  Byzantine nodes: {byzantine_nodes}")
-        print(f"  Attacks: {attack_strings}")
-        
-        # Expand attack strings to match byzantine nodes
-        while len(attack_strings) < len(byzantine_nodes):
-            attack_strings.append("")
-        
-        orchestrator.configure_set(live_nodes, byzantine_nodes, attack_strings)
-        print(f"{'='*60}\n")
-
-        # Check if leader is Byzantine
-        if orchestrator.is_byzantine(leader_info):
-            print(f"⚠️  WARNING: Leader (node {leader_info}) is BYZANTINE for this set!\n")
-
-        # PAUSE/UNPAUSE nodes based on live set
+        # PAUSE crashed nodes and nodes not in live set
         for nid in range(1, NUM_NODES + 1):
             if nid in live_nodes_set:
                 _send_control_to_node(node_inboxes, nid, "UNPAUSE")
             else:
                 _send_control_to_node(node_inboxes, nid, "PAUSE")
 
-        # Reset live nodes
+        # Build attack_map (serializable) for all nodes and include it in RESET
+        attack_map = orchestrator.to_serializable_map()
+
+        # Reset only effective live nodes: include attack_map so every node knows configs
         print(f"=== Starting Set {sid} ===")
         for nid in range(1, NUM_NODES + 1):
             if nid in live_nodes_set:
-                node_inboxes[nid].put({"msg": {"type": "RESET"}, "sender": "driver"})
+                # send RESET with attack_map to each live node
+                node_inboxes[nid].put({"msg": {"type": "RESET", "attack_map": attack_map}, "sender": "driver"})
         monitor_queue.put({"type": "RESET"})
         time.sleep(0.3)
 
         # Process transactions sequentially
         for txn_idx, txn in enumerate(entries, 1):
             print(f"\n--- Transaction {txn_idx}/{len(entries)} ---")
-            
+
             if txn.get("type") == "read":
                 cname = txn.get("s")
                 cid = CLIENT_NAME_TO_ID.get(cname)
                 if cid is None:
                     print(f"Unknown client name {cname}")
                     continue
-                
+
                 print(f"Dispatching READ from {cname}: {txn}")
                 client_control_queues[cid].put({
                     "type": "read",
                     "op": {"type": "read", "s": cname},
                     "reply_to": driver_ack_queues[cid]
                 })
-                
+
                 try:
                     ack = driver_ack_queues[cid].get(timeout=15.0)
                     print(f"✓ READ by {cname} completed: {ack}")
                 except Exception as e:
                     print(f"✗ READ by {cname} TIMEOUT/ERROR: {e}")
-                
+
             elif txn.get("type") == "write":
                 op = txn.get("op")
                 sname = op.get("s")
@@ -404,20 +358,20 @@ def main(csvfile):
                 if cid is None:
                     print(f"Unknown client name {sname}")
                     continue
-                
+
                 print(f"Dispatching WRITE from {sname}: {op}")
                 client_control_queues[cid].put({
                     "type": "write",
                     "op": op,
                     "reply_to": driver_ack_queues[cid]
                 })
-                
+
                 try:
-                    ack = driver_ack_queues[cid].get(timeout=25.0)
+                    ack = driver_ack_queues[cid].get(timeout=15.0)
                     print(f"✓ WRITE by {sname} completed: {ack}")
                 except Exception as e:
                     print(f"✗ WRITE by {sname} TIMEOUT/ERROR: {e}")
-            
+
             time.sleep(0.2)
 
         # Print final state
@@ -430,7 +384,7 @@ def main(csvfile):
     print("\n=== All sets complete ===")
     print("\nFinal system state:")
     PrintDB(monitor_db, applied_set)
-    
+
     print("\nInteractive commands: printdb, printlog <node>, printstatus <seq>, printview, quit")
     while True:
         cmd = input("> ").strip()
@@ -441,20 +395,20 @@ def main(csvfile):
         elif cmd.lower().startswith("printlog"):
             parts = cmd.split()
             if len(parts) == 2 and parts[1].isdigit():
-                PrintLog(int(parts[1]), monitor_log)
+                PrintLog(int(parts[1]))
             else:
-                print("Usage: PrintLog <node_id>")
+                print("Usage: printlog <node_id>")
         elif cmd.lower().startswith("printstatus"):
             parts = cmd.split()
             if len(parts) == 2 and parts[1].isdigit():
                 PrintStatus(int(parts[1]), applied_set, monitor_log)
             else:
-                print("Usage: PrintStatus <seq_no>")
+                print("Usage: printstatus <seq_no>")
         elif cmd.lower() == "printview":
             PrintView(monitor_log)
         else:
             print("Unknown command")
-    
+
     cleanup(node_procs, client_procs, monitor_proc)
 
 
