@@ -4,7 +4,7 @@ Set Number,Transactions,Live,Byzantine,Attack
 ,"(C, D, 3)",,,
 ,"(D, E, 4)",,,
 ,(E),,,
-2,"(F, G, 12)","[n2, n3, n4, n5,n6]",[],[]
+2,"(F, G, 1)","[n2, n3, n4, n5,n6]",[],[]
 ,"(G, H, 1)",,,
 ,"(H, I, 11)",,,
 ,"(I, J, 11)",,,

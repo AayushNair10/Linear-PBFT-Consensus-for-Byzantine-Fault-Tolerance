@@ -1,11 +1,9 @@
 # run_driver.py - With Byzantine attack support
 """
 Driver with full Byzantine attack support.
-Key changes:
-- Uses csv_parser.parse_csv_with_attacks()
-- Initializes attack orchestrator
-- Configures attacks before each set
-- Handles Byzantine node initialization
+
+Small modification: node base_timer default reduced to 1.0s so view-change detection is faster.
+(Each node's actual timeout is base_timer + node_id which staggers timers.)
 """
 
 import multiprocessing as mp
@@ -243,17 +241,17 @@ def main(csvfile):
 
     readiness_queue = manager.Queue()
 
-    # Start nodes
+    # Start nodes with smaller base timer (1 second) so view-change detection is faster.
     node_procs = []
     for nid in range(1, NUM_NODES + 1):
         p = mp.Process(target=node_process_main, args=(
-            nid, NUM_NODES, keyring,
-            node_inboxes[nid],
-            node_inboxes,
-            client_reply_queues,
-            monitor_queue,
+            nid, NUM_NODES, keyring, 
+            node_inboxes[nid],      # node's inbox
+            node_inboxes,            # all node inboxes for node-to-node communication
+            client_reply_queues,     # client reply queues for sending REPLY messages
+            monitor_queue, 
             readiness_queue,
-            10.0
+            1.0                      # base timer = 1 second (node's actual timeout = 1.0 + node_id)
         ))
         p.start()
         node_procs.append(p)
@@ -273,15 +271,15 @@ def main(csvfile):
     if ready_count < NUM_NODES:
         print(f"Warning: only {ready_count}/{NUM_NODES} nodes ready")
 
-    # Start clients
+    # Start clients with shorter timeout (8 seconds instead of 10)
     client_procs = []
     for cid in range(1, NUM_CLIENTS + 1):
         p = mp.Process(target=client_process_main, args=(
-            cid,
-            client_control_queues[cid],
-            client_reply_queues[cid],
-            node_inboxes,
-            10.0
+            cid, 
+            client_control_queues[cid], 
+            client_reply_queues[cid], 
+            node_inboxes, 
+            8.0  # client timeout = 8 seconds
         ))
         p.start()
         client_procs.append(p)
@@ -415,7 +413,7 @@ def main(csvfile):
                 })
                 
                 try:
-                    ack = driver_ack_queues[cid].get(timeout=15.0)
+                    ack = driver_ack_queues[cid].get(timeout=25.0)
                     print(f"✓ WRITE by {sname} completed: {ack}")
                 except Exception as e:
                     print(f"✗ WRITE by {sname} TIMEOUT/ERROR: {e}")
@@ -445,13 +443,13 @@ def main(csvfile):
             if len(parts) == 2 and parts[1].isdigit():
                 PrintLog(int(parts[1]), monitor_log)
             else:
-                print("Usage: printlog <node_id>")
+                print("Usage: PrintLog <node_id>")
         elif cmd.lower().startswith("printstatus"):
             parts = cmd.split()
             if len(parts) == 2 and parts[1].isdigit():
                 PrintStatus(int(parts[1]), applied_set, monitor_log)
             else:
-                print("Usage: printstatus <seq_no>")
+                print("Usage: PrintStatus <seq_no>")
         elif cmd.lower() == "printview":
             PrintView(monitor_log)
         else:
