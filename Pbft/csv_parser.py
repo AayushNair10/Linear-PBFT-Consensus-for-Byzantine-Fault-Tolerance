@@ -1,6 +1,10 @@
-# csv_parser.py - Updated parser with Byzantine/Attack support
+# csv_parser.py - Fixed parser for multiple Byzantine nodes with single attack
 """
 Parse CSV with Live, Byzantine, and Attack columns.
+
+IMPORTANT FIX: When Byzantine column has multiple nodes like [n1, n2]
+and Attack column has single attack like [crash], that attack applies
+to ALL Byzantine nodes listed.
 """
 
 import csv
@@ -39,17 +43,34 @@ def _parse_byzantine_field(byz_field: str) -> List[int]:
 
 def _parse_attack_field(attack_field: str) -> List[str]:
     """
-    Parse Attack field which may contain multiple attacks separated by semicolons.
-    Example: "[crash]" -> ["crash"]
-    Example: "[time; dark(n6)]" -> ["time; dark(n6)"]
+    Parse Attack field.
     
-    Returns list with one attack string (which may contain multiple attacks separated by ;)
+    Examples:
+        "[crash]" -> ["crash"]
+        "[time; dark(n6)]" -> ["time; dark(n6)"]
+        "[crash], [sign]" -> ["crash", "sign"]  (comma-separated for multiple nodes)
+    
+    Returns list of attack strings. If single attack in brackets, returns one element.
+    If comma-separated attacks, returns multiple elements (one per Byzantine node).
     """
     if not attack_field or attack_field.strip() == "" or attack_field.strip() == "[]":
         return []
     
-    # Remove outer brackets
     s = attack_field.strip()
+    
+    # Check if it contains comma-separated attacks like "[crash], [sign]"
+    if '],' in s or '], [' in s:
+        # Split by comma and clean each part
+        parts = []
+        for part in s.split(','):
+            part = part.strip()
+            if part.startswith('[') and part.endswith(']'):
+                part = part[1:-1].strip()
+            if part:
+                parts.append(part)
+        return parts if parts else []
+    
+    # Single attack in brackets: "[crash]" or "[time; dark(n6)]"
     if s.startswith('[') and s.endswith(']'):
         s = s[1:-1].strip()
     
@@ -57,13 +78,15 @@ def _parse_attack_field(attack_field: str) -> List[str]:
         return []
     
     # Return the entire attack string as one element
-    # (it may contain semicolons for multiple attacks)
     return [s]
 
 
 def parse_csv_with_attacks(filename: str) -> List[Dict[str, Any]]:
     """
     Parse CSV file with Live, Byzantine, and Attack columns.
+    
+    IMPORTANT: If Byzantine has multiple nodes [n1, n2] and Attack has single value [crash],
+    that attack is applied to ALL Byzantine nodes.
     
     Returns list of sets, each containing:
     {
@@ -160,7 +183,16 @@ def parse_csv_with_attacks(filename: str) -> List[Dict[str, Any]]:
         if s["live"] is None:
             s["live"] = list(range(1, 8))  # Default: all 7 nodes
         
-        # Ensure attacks list matches byzantine list length
+        # IMPORTANT FIX: If multiple Byzantine nodes but single attack,
+        # replicate that attack for all Byzantine nodes
+        # This handles cases like Byzantine: [n1, n2], Attack: [crash]
+        # Result should be: attacks = ["crash", "crash"]
+        if len(s["byzantine"]) > len(s["attacks"]) and len(s["attacks"]) == 1:
+            # Single attack for multiple nodes - replicate it
+            single_attack = s["attacks"][0]
+            s["attacks"] = [single_attack] * len(s["byzantine"])
+        
+        # Ensure attacks list matches byzantine list length (padding with empty if needed)
         while len(s["attacks"]) < len(s["byzantine"]):
             s["attacks"].append("")
     

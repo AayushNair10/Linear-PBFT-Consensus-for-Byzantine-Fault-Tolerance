@@ -81,6 +81,9 @@ class Node:
         self.datastore: Dict[str, int] = {}
         self.timer = None
         self.timer_timeout = base_timer + float(self.id)  # base + node id offset
+        self.view_change_timer = None  # Timer for waiting for NEW-VIEW
+        self.view_change_timeout = 12.0  # 12 seconds to wait for NEW-VIEW
+        self.target_view = None
 
         self._stop = threading.Event()
         self.active = True
@@ -200,6 +203,46 @@ class Node:
             self.timer = None
             self.log_event("Stopped request timer")
 
+    def start_view_change_timer(self, target_view: int):
+        """Start timer for waiting for NEW-VIEW (handles consecutive leader failures)."""
+        if self.view_change_timer and self.view_change_timer.is_alive():
+            return
+        
+        # Store which view we're waiting for
+        self.target_view = target_view
+        
+        self.log_event(f"Starting view-change timer ({self.view_change_timeout:.1f}s) - waiting for NEW-VIEW for view {target_view}")
+        self.view_change_timer = threading.Timer(self.view_change_timeout, self._on_view_change_timer_expiry)
+        self.view_change_timer.daemon = True
+        self.view_change_timer.start()
+
+    def stop_view_change_timer(self):
+        """Cancel the view-change timer if running."""
+        if self.view_change_timer:
+            try:
+                self.view_change_timer.cancel()
+            except Exception:
+                pass
+            self.view_change_timer = None
+            self.target_view = None
+            self.log_event("Stopped view-change timer")
+
+    def _on_view_change_timer_expiry(self):
+        """Called when view-change timer expires (no NEW-VIEW received)."""
+        if not self.in_view_change:
+            return  # Already resolved
+        
+        # IMPORTANT: Increment from the target view we were waiting for, not self.view
+        # Because self.view is still the old view (we haven't entered the new one yet)
+        next_target = self.target_view + 1 if self.target_view is not None else self.view + 2
+        
+        self.log_event(f"⏰ View-change timer expired: NEW-VIEW for view {self.target_view} not received, starting view-change to view {next_target}")
+        try:
+            # Start view-change for next view
+            self.start_view_change(next_target)
+        except Exception as e:
+            self.log_event(f"Exception starting cascaded view-change: {e}")
+            
     def _on_timer_expiry(self):
         """Called when request timer expires."""
         self.log_event(f"⏱️ Request timer expired in view {self.view}: initiating view-change")
@@ -207,6 +250,7 @@ class Node:
             self.start_view_change(self.view + 1)
         except Exception as e:
             self.log_event(f"Exception starting view-change: {e}")
+
 
     # -----------------------
     # Sending helpers (honest + attack behavior)
@@ -259,20 +303,55 @@ class Node:
             self.log_event(f"📤 Multicasted {msg.get('type')} seq={msg.get('seq','')} to {sent} replicas")
 
     def send_to_node(self, target: int, msg: Dict[str, Any]):
-        """Send point-to-point message to another node with a single MAC.
-           Observe dark attack rule when target is dropped by this node.
-        """
-        # ATTACK: if this node is configured to drop messages to 'target', do nothing
-        if getattr(self.attack_config, "dark_attack", False) and target in getattr(self.attack_config, "dark_targets", set()):
-            self.log_event(f"🔴 ATTACK: Dropped {msg.get('type')} to node {target} (dark)")
-            return
-
+        """Send a point-to-point message to another node with a single MAC."""
         msg_bytes = json.dumps(msg, sort_keys=True).encode("utf-8")
         try:
             mac = mac_for_pair(self.keyring, self.id, target, msg_bytes)
             envelope = {"msg": msg, "mac": mac, "sender": self.id}
         except Exception:
             envelope = {"msg": msg, "sender": self.id}
+
+        # ATTACK: Skip if dark attack targets this node (do this before sending)
+        if self.attack_config.should_drop_message_to(target):
+            self.log_event(f"🔴 ATTACK: Dropped {msg.get('type')} to node {target} (dark)")
+            return
+
+        # ATTACK: corrupt single-MAC if sign_attack is active (flip one bit of the MAC)
+        if getattr(self.attack_config, "sign_attack", False) and "mac" in envelope:
+            mac_val = envelope["mac"]
+            corrupted = None
+            # bytes / bytearray -> flip last byte LSB
+            if isinstance(mac_val, (bytes, bytearray)):
+                ba = bytearray(mac_val)
+                if len(ba) == 0:
+                    ba = bytearray(b'\x01')
+                else:
+                    ba[-1] ^= 0x01
+                corrupted = bytes(ba)
+            elif isinstance(mac_val, str):
+                # Try hex decode (common if mac was hex string); if decode fails mutate last char
+                try:
+                    b = bytes.fromhex(mac_val)
+                    ba = bytearray(b)
+                    if len(ba) == 0:
+                        ba = bytearray(b'\x01')
+                    else:
+                        ba[-1] ^= 0x01
+                    corrupted = ba.hex()
+                except Exception:
+                    # fallback: flip low bit of last char code
+                    if len(mac_val) == 0:
+                        corrupted = "X"
+                    else:
+                        last = ord(mac_val[-1])
+                        newch = chr((last ^ 0x01) % 256)
+                        corrupted = mac_val[:-1] + newch
+            else:
+                # unknown type, set to an obviously-bad sentinel
+                corrupted = b"CORRUPT"
+
+            envelope["mac"] = corrupted
+            self.log_event(f"🔴 ATTACK: Corrupted single-MAC for {msg.get('type')} -> target {target}")
 
         q = self.out_queues.get(target)
         if q:
@@ -283,7 +362,7 @@ class Node:
     def send_to_client(self, client_id: int, msg: Dict[str, Any]):
         """Send a REPLY message to a client with a single MAC."""
         # ATTACK: Crash attack - don't send replies
-        if msg.get("type") == MSG_REPLY and getattr(self.attack_config, "crash_attack", False) and self.attack_config.should_block_reply():
+        if msg.get("type") == MSG_REPLY and self.attack_config.should_block_reply():
             self.log_event(f"🔴 ATTACK: Crash - not sending REPLY to client {client_id}")
             return
 
@@ -293,6 +372,39 @@ class Node:
             envelope = {"msg": msg, "mac": mac, "sender": self.id}
         except Exception:
             envelope = {"msg": msg, "sender": self.id}
+
+        # ATTACK: corrupt reply MAC if sign_attack is active (flip one bit)
+        if getattr(self.attack_config, "sign_attack", False) and "mac" in envelope:
+            mac_val = envelope["mac"]
+            corrupted = None
+            if isinstance(mac_val, (bytes, bytearray)):
+                ba = bytearray(mac_val)
+                if len(ba) == 0:
+                    ba = bytearray(b'\x01')
+                else:
+                    ba[-1] ^= 0x01
+                corrupted = bytes(ba)
+            elif isinstance(mac_val, str):
+                try:
+                    b = bytes.fromhex(mac_val)
+                    ba = bytearray(b)
+                    if len(ba) == 0:
+                        ba = bytearray(b'\x01')
+                    else:
+                        ba[-1] ^= 0x01
+                    corrupted = ba.hex()
+                except Exception:
+                    if len(mac_val) == 0:
+                        corrupted = "X"
+                    else:
+                        last = ord(mac_val[-1])
+                        newch = chr((last ^ 0x01) % 256)
+                        corrupted = mac_val[:-1] + newch
+            else:
+                corrupted = b"CORRUPT"
+
+            envelope["mac"] = corrupted
+            self.log_event(f"🔴 ATTACK: Corrupted single-MAC for REPLY to client {client_id}")
 
         q = self.client_queues.get(client_id)
         if q:
@@ -828,19 +940,21 @@ class Node:
             return
 
         self.stop_request_timer()
+        # Start the view-change timer for the new target view
+        self.start_view_change_timer(target_view)
 
-        if self.in_view_change:
-            self.log_event(f"Already in view-change for view {target_view}")
-            return
-
-        self.in_view_change = True
-        self.log_event(f"🔄 Starting view-change to view {target_view}")
-
+        # IMPORTANT FIX: Check if we already sent VIEW-CHANGE for THIS target_view
+        # Don't just check in_view_change flag - that blocks cascading view-changes
         with self.state_lock:
             if self.id in self.view_change_msgs.get(target_view, {}):
                 self.log_event(f"Already sent VIEW-CHANGE for view {target_view}")
                 return
 
+        # Now set the flag (we're starting a new view-change)
+        self.in_view_change = True
+        self.log_event(f"🔄 Starting view-change to view {target_view}")
+
+        with self.state_lock:
             P = []
             for seq, st in self.seq_state.items():
                 if seq <= self.low:
@@ -849,7 +963,7 @@ class Node:
                 prepares = st.get("prepares", {})
                 if pre is not None and len(prepares) >= (2 * F + 1):
                     pm = {"seq": seq, "view": pre.get("view"), "digest": pre.get("digest"),
-                          "prepares": list(prepares.values()), "request": pre.get("request", None)}
+                        "prepares": list(prepares.values()), "request": pre.get("request", None)}
                     P.append(pm)
 
             view_change_msg = {"type": "VIEW_CHANGE", "v": target_view, "n": self.low, "C": [], "P": P, "i": self.id}
@@ -859,6 +973,7 @@ class Node:
         # Originating node multicasts VIEW-CHANGE to inform all replicas that VC process started
         self.multicast_with_authenticator(view_change_msg)
         self.log_event(f"✅ Multicasted VIEW-CHANGE for view {target_view} with {len(P)} P-entries")
+
 
     def _delayed_view_change(self, target_view: int):
         """Delayed view-change to avoid message storms."""
@@ -894,6 +1009,8 @@ class Node:
         self.log_event(f"Received/Observed VIEW-CHANGE for view {target_view} from {sender}")
 
         self.stop_request_timer()
+        # ADD THIS LINE:
+        self.start_view_change_timer(target_view)
         self.in_view_change = True
 
         with self.state_lock:
@@ -1008,6 +1125,8 @@ class Node:
         self.view = target_view
         self.in_view_change = False
         self.stop_request_timer()
+        
+        self.stop_view_change_timer()
         self.log_event(f"Installed NEW-VIEW, now in view {self.view}")
 
         with self.state_lock:
@@ -1079,6 +1198,7 @@ class Node:
         self.view = target_view
         self.in_view_change = False
         self.stop_request_timer()
+        self.stop_view_change_timer()
         self.log_event(f"🎉 Entered view {self.view} with primary {leader_for_view(self.view, self.n)}")
 
         # Send PREPARE messages for all entries in O to the new primary
@@ -1106,7 +1226,17 @@ class Node:
     # RESET and installing attack_map
     # -----------------------
     def handle_reset(self, envelope: Dict[str, Any]):
-        """Handle RESET. If an 'attack_map' is present in envelope, install it."""
+        # cancel any running timers to avoid old timeouts firing
+        try:
+            self.stop_request_timer()
+        except Exception:
+            pass
+        
+        try:
+            self.stop_view_change_timer()
+        except Exception:
+            pass
+
         if not self.active:
             # even if paused, do not ignore RESET so driver can resume state
             pass
@@ -1141,15 +1271,97 @@ class Node:
         self.reset_datastore()
         self.in_view_change = False
         self.view = 0
+        
+        # IMPORTANT: Reset sequence number to 1 (not 0)
+        self.next_seq = 1
+        self.low = 0
+        self.high = self.low + WINDOW_SIZE
+        
         with self.state_lock:
             self.processed_requests.clear()
             self.seq_state.clear()
+            self.view_change_msgs.clear()
+            self.new_view_msgs.clear()
 
         # Clear message log for new set
         with self.message_log_lock:
             self.message_log.clear()
 
-        self.log_event(f"Reset complete (Byzantine={self.attack_config.is_byzantine})")
+        self.log_event(f"Reset complete - sequence starts at {self.next_seq} (Byzantine={self.attack_config.is_byzantine})")
+
+
+
+    def handle_get_log(self, envelope: Dict[str, Any]):
+        """Handle GET_LOG request from driver - return message log."""
+        msg = envelope.get("msg", {})
+        reply_queue = envelope.get("reply_queue")
+        
+        if reply_queue is None:
+            return
+        
+        # Return a copy of the message log
+        try:
+            log_copy = self.get_message_log()
+            response = {
+                "type": "LOG_RESPONSE",
+                "node_id": self.id,
+                "log": log_copy
+            }
+            reply_queue.put(response)
+            self.log_event(f"Sent message log to driver ({len(log_copy)} entries)")
+        except Exception as e:
+            self.log_event(f"Error sending log to driver: {e}")
+
+
+    def handle_get_status(self, envelope: Dict[str, Any]):
+        """Handle GET_STATUS request from driver - return sequence statuses."""
+        msg = envelope.get("msg", {})
+        reply_queue = envelope.get("reply_queue")
+        
+        if reply_queue is None:
+            return
+        
+        # Collect status for all sequences
+        statuses = {}
+        with self.state_lock:
+            for seq, st in self.seq_state.items():
+                status = st.get("status", "X")
+                statuses[seq] = status
+        
+        try:
+            response = {
+                "type": "STATUS_RESPONSE",
+                "node_id": self.id,
+                "statuses": statuses
+            }
+            reply_queue.put(response)
+            self.log_event(f"Sent status for {len(statuses)} sequences to driver")
+        except Exception as e:
+            self.log_event(f"Error sending status to driver: {e}")
+
+
+    def handle_get_new_view(self, envelope: Dict[str, Any]):
+        """Handle GET_NEW_VIEW request from driver - return NEW-VIEW messages."""
+        msg = envelope.get("msg", {})
+        reply_queue = envelope.get("reply_queue")
+        
+        if reply_queue is None:
+            return
+        
+        # Return copy of new_view_msgs
+        try:
+            with self.state_lock:
+                nv_copy = list(self.new_view_msgs)
+            
+            response = {
+                "type": "NEW_VIEW_RESPONSE",
+                "node_id": self.id,
+                "new_view_msgs": nv_copy
+            }
+            reply_queue.put(response)
+            self.log_event(f"Sent {len(nv_copy)} NEW-VIEW messages to driver")
+        except Exception as e:
+            self.log_event(f"Error sending NEW-VIEW to driver: {e}")
 
     # -----------------------
     # Main loop
@@ -1168,8 +1380,13 @@ class Node:
             msg = envelope.get("msg", {})
             mtype = msg.get("type")
 
+            # Handle PAUSE/UNPAUSE
             if mtype == "PAUSE":
                 if self.active:
+                    try:
+                        self.stop_request_timer()
+                    except Exception:
+                        pass
                     self.active = False
                     self.log_event("PAUSED (simulated down)")
                 continue
@@ -1179,15 +1396,17 @@ class Node:
                     self.log_event("UNPAUSED (resuming)")
                 continue
 
+            # Handle AUTH_INIT
             if mtype == "AUTH_INIT":
                 if self.verify_authenticator_for_self(envelope):
                     self.log_event(f"Verified AUTH_INIT from {envelope.get('sender')}")
                 continue
 
-            # while in view-change only accept VC / NEW_VIEW / RESET
-            if self.in_view_change and mtype not in ("VIEW_CHANGE", "NEW_VIEW", "RESET"):
+            # While in view-change only accept VC / NEW_VIEW / RESET
+            if self.in_view_change and mtype not in ("VIEW_CHANGE", "NEW_VIEW", "RESET", "GET_LOG", "GET_STATUS", "GET_NEW_VIEW"):
                 continue
 
+            # Handle protocol messages
             if mtype == MSG_REQUEST:
                 op = msg.get("op", {})
                 if op.get("type") == "read":
@@ -1211,6 +1430,14 @@ class Node:
                 self.handle_new_view(envelope)
             elif mtype == "RESET":
                 self.handle_reset(envelope)
+            
+            # ADD THESE NEW HANDLERS:
+            elif mtype == "GET_LOG":
+                self.handle_get_log(envelope)
+            elif mtype == "GET_STATUS":
+                self.handle_get_status(envelope)
+            elif mtype == "GET_NEW_VIEW":
+                self.handle_get_new_view(envelope)
 
         self.log_event("Node stopped")
 

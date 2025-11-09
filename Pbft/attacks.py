@@ -145,43 +145,44 @@ class AttackConfig:
     # serialization helpers
     # -------------------------
     def to_dict(self) -> Dict[str, Any]:
-        """Return a fully-serializable dict representation of this config."""
+        """Serialize AttackConfig to a JSON-friendly dict."""
         return {
-            "node_id": int(self.node_id),
-            "is_byzantine": bool(self.is_byzantine),
-            "sign_attack": bool(self.sign_attack),
-            "crash_attack": bool(self.crash_attack),
-            "dark_attack": bool(self.dark_attack),
-            "time_attack": bool(self.time_attack),
-            "equivocation_attack": bool(self.equivocation_attack),
-            "dark_targets": sorted(list(self.dark_targets)),
+            "node_id": self.node_id,
+            "is_byzantine": self.is_byzantine,
+            "sign_attack": self.sign_attack,
+            "crash_attack": self.crash_attack,
+            "dark_attack": self.dark_attack,
+            "time_attack": self.time_attack,
+            "equivocation_attack": self.equivocation_attack,
+            "dark_targets": list(self.dark_targets),
             "time_delay_ms": float(self.time_delay_ms),
             "equivocation_targets": list(self.equivocation_targets),
-            "crash_block_prepares": bool(self.crash_block_prepares),
-            "crash_block_commits": bool(self.crash_block_commits),
-            "crash_block_replies": bool(self.crash_block_replies),
-            "crash_block_newview": bool(self.crash_block_newview),
+            "crash_block_prepares": self.crash_block_prepares,
+            "crash_block_commits": self.crash_block_commits,
+            "crash_block_replies": self.crash_block_replies,
+            "crash_block_newview": self.crash_block_newview
         }
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "AttackConfig":
-        """Reconstruct AttackConfig from serialized dict."""
-        node_id = int(d.get("node_id", -1))
-        ac = cls(node_id)
-        ac.is_byzantine = bool(d.get("is_byzantine", False))
-        ac.sign_attack = bool(d.get("sign_attack", False))
-        ac.crash_attack = bool(d.get("crash_attack", False))
-        ac.dark_attack = bool(d.get("dark_attack", False))
-        ac.time_attack = bool(d.get("time_attack", False))
-        ac.equivocation_attack = bool(d.get("equivocation_attack", False))
-        ac.dark_targets = set(int(x) for x in d.get("dark_targets", []))
-        ac.time_delay_ms = float(d.get("time_delay_ms", 1000.0))
-        ac.equivocation_targets = [int(x) for x in d.get("equivocation_targets", [])]
-        ac.crash_block_prepares = bool(d.get("crash_block_prepares", False))
-        ac.crash_block_commits = bool(d.get("crash_block_commits", False))
-        ac.crash_block_replies = bool(d.get("crash_block_replies", False))
-        ac.crash_block_newview = bool(d.get("crash_block_newview", False))
+    def from_dict(cls, data: Dict[str, Any]) -> "AttackConfig":
+        """Reconstruct AttackConfig from a dict produced by to_dict()."""
+        nid = int(data.get("node_id", 0))
+        ac = cls(nid)
+        ac.is_byzantine = bool(data.get("is_byzantine", False))
+        ac.sign_attack = bool(data.get("sign_attack", False))
+        ac.crash_attack = bool(data.get("crash_attack", False))
+        ac.dark_attack = bool(data.get("dark_attack", False))
+        ac.time_attack = bool(data.get("time_attack", False))
+        ac.equivocation_attack = bool(data.get("equivocation_attack", False))
+        ac.dark_targets = set(int(x) for x in data.get("dark_targets", []))
+        ac.time_delay_ms = float(data.get("time_delay_ms", ac.time_delay_ms))
+        ac.equivocation_targets = [int(x) for x in data.get("equivocation_targets", [])]
+        ac.crash_block_prepares = bool(data.get("crash_block_prepares", False))
+        ac.crash_block_commits = bool(data.get("crash_block_commits", False))
+        ac.crash_block_replies = bool(data.get("crash_block_replies", False))
+        ac.crash_block_newview = bool(data.get("crash_block_newview", False))
         return ac
+
 
     # -------------------------
     # query methods used by Node
