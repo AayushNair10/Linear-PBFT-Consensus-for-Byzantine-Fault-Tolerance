@@ -10,7 +10,7 @@ import multiprocessing as mp
 import sys
 import time
 from keys import create_keyring
-from node import node_process_main
+from Node.node import node_process_main
 from client import client_process_main
 from monitor import monitor_main
 from common import leader_for_view
@@ -53,9 +53,6 @@ def PrintDB(monitor_db, _applied_set=None):
         line = f"Node {node_id}: " + " ".join(parts)
         if node_id not in LAST_LIVE_NODES:
             line += " (simulated down)"
-
-        if orchestrator and orchestrator.is_byzantine(node_id):
-            line += " [BYZANTINE]"
 
         print(line)
 
@@ -266,7 +263,7 @@ def collect_node_logs(node_inboxes, reply_queue, timeout=2.0):
     # Send GET_LOG request to each node
     for node_id in range(1, NUM_NODES + 1):
         if node_id not in LAST_LIVE_NODES:
-            continue  # Skip nodes that are down
+            continue
         
         q = node_inboxes.get(node_id)
         if q:
@@ -331,7 +328,7 @@ def collect_node_status(node_inboxes, reply_queue, timeout=2.0):
             response = reply_queue.get(timeout=0.5)
             if isinstance(response, dict) and response.get("type") == "STATUS_RESPONSE":
                 node_id = response.get("node_id")
-                seq_statuses = response.get("statuses", {})  # {seq: status}
+                seq_statuses = response.get("statuses", {})
                 
                 for seq, status in seq_statuses.items():
                     if seq not in all_statuses:
@@ -404,27 +401,23 @@ def collect_new_view_messages(node_inboxes, reply_queue, timeout=2.0):
 
 def cleanup(node_procs, client_procs, monitor_proc):
     """Terminate all processes."""
-    print("Terminating clients...")
     for p in client_procs:
         try:
             p.terminate()
             p.join(timeout=1.0)
         except Exception:
             pass
-    print("Terminating nodes...")
     for p in node_procs:
         try:
             p.terminate()
             p.join(timeout=1.0)
         except Exception:
             pass
-    print("Terminating monitor...")
     try:
         monitor_proc.terminate()
         monitor_proc.join(timeout=1.0)
     except Exception:
         pass
-    print("Cleanup done")
 
 
 def _send_control_to_node(node_inboxes, nid, msg_type):
@@ -448,26 +441,18 @@ def main(csvfile):
 
     # Initialize attack orchestrator
     orchestrator = initialize_orchestrator(NUM_NODES)
-    print(f"Initialized attack orchestrator for {NUM_NODES} nodes")
 
     # Parse CSV with attack support
-    print(f"\nParsing CSV file: {csvfile}")
     sets = parse_csv_with_attacks(csvfile)
     if not sets:
-        print("No sets parsed; exiting.")
         return
-
-    print(f"\nParsed {len(sets)} sets:")
-    for s in sets:
-        print(f"  Set {s['set_no']}: {len(s['transactions'])} txns, "
-              f"live={s.get('live')}, byzantine={s.get('byzantine')}, attacks={s.get('attacks')}")
 
     # Create queues
     node_inboxes = {nid: manager.Queue() for nid in range(1, NUM_NODES + 1)}
     client_control_queues = {cid: manager.Queue() for cid in range(1, NUM_CLIENTS + 1)}
     client_reply_queues = {cid: manager.Queue() for cid in range(1, NUM_CLIENTS + 1)}
     driver_ack_queues = {cid: manager.Queue() for cid in range(1, NUM_CLIENTS + 1)}
-    driver_reply_queue = manager.Queue()  # For collecting logs/status from nodes
+    driver_reply_queue = manager.Queue()
 
     monitor_queue = manager.Queue()
     monitor_db = manager.dict()
@@ -509,9 +494,6 @@ def main(csvfile):
             break
         if isinstance(msg, dict) and msg.get("type") == "NODE_READY":
             ready_count += 1
-            print(f"Driver: NODE_READY from node {msg.get('node')} ({ready_count}/{NUM_NODES})")
-    if ready_count < NUM_NODES:
-        print(f"Warning: only {ready_count}/{NUM_NODES} nodes ready")
 
     # Start clients
     client_procs = []
@@ -529,10 +511,9 @@ def main(csvfile):
     time.sleep(0.5)
 
     # Initial menu before first set
-    print("\n" + "="*60)
     print("All nodes are up and ready.")
-    print("="*60)
-    print("Commands: [Enter=start first set, PrintDB, quit]")
+    print("-"*60)
+    print("Commands: [Enter= Process set 1, PrintDB, quit]")
     
     while True:
         cmd = input("> ").strip()
@@ -568,16 +549,11 @@ def main(csvfile):
         byzantine_nodes = s.get("byzantine", [])
         attack_strings = s.get("attacks", [])
 
-        # Note: CSV parser now handles replicating single attack to multiple Byzantine nodes
-        # No need for additional logic here
-
         # Configure orchestrator
         orchestrator.configure_set(live_nodes, byzantine_nodes, attack_strings)
 
         # Determine crashed nodes
         crashed = orchestrator.get_crashed_nodes()
-        if crashed:
-            print(f"⚠️  Crashed nodes for this set (will be PAUSED even if listed live): {crashed}")
 
         # Effective live nodes
         live_nodes_set = set(live_nodes) - set(crashed)
@@ -592,13 +568,10 @@ def main(csvfile):
             else:
                 _send_control_to_node(node_inboxes, nid, "PAUSE")
 
-        # Build attack_map and send RESET (this resets sequence numbers to start from 1)
+        # Build attack_map and send RESET
         attack_map = orchestrator.to_serializable_map()
 
         print(f"\n=== Starting Set {sid} ===")
-        print(f"Leader: Node {leader_info}")
-        print(f"Live nodes (CSV): {sorted(list(live_nodes))}")
-        print(f"Effective live nodes (after crash): {sorted(list(live_nodes_set))}")
         
         for nid in range(1, NUM_NODES + 1):
             if nid in live_nodes_set:
@@ -608,16 +581,12 @@ def main(csvfile):
 
         # Process transactions sequentially
         for txn_idx, txn in enumerate(entries, 1):
-            print(f"\n--- Transaction {txn_idx}/{len(entries)} ---")
-
             if txn.get("type") == "read":
                 cname = txn.get("s")
                 cid = CLIENT_NAME_TO_ID.get(cname)
                 if cid is None:
-                    print(f"Unknown client name {cname}")
                     continue
 
-                print(f"Dispatching READ from {cname}: {txn}")
                 client_control_queues[cid].put({
                     "type": "read",
                     "op": {"type": "read", "s": cname},
@@ -625,20 +594,17 @@ def main(csvfile):
                 })
 
                 try:
-                    ack = driver_ack_queues[cid].get(timeout=15.0)
-                    print(f"✓ READ by {cname} completed: {ack}")
-                except Exception as e:
-                    print(f"✗ READ by {cname} TIMEOUT/ERROR: {e}")
+                    driver_ack_queues[cid].get(timeout=15.0)
+                except Exception:
+                    pass
 
             elif txn.get("type") == "write":
                 op = txn.get("op")
                 sname = op.get("s")
                 cid = CLIENT_NAME_TO_ID.get(sname)
                 if cid is None:
-                    print(f"Unknown client name {sname}")
                     continue
 
-                print(f"Dispatching WRITE from {sname}: {op}")
                 client_control_queues[cid].put({
                     "type": "write",
                     "op": op,
@@ -646,34 +612,25 @@ def main(csvfile):
                 })
 
                 try:
-                    ack = driver_ack_queues[cid].get(timeout=15.0)
-                    print(f"✓ WRITE by {sname} completed: {ack}")
-                except Exception as e:
-                    print(f"✗ WRITE by {sname} TIMEOUT/ERROR: {e}")
+                    driver_ack_queues[cid].get(timeout=15.0)
+                except Exception:
+                    pass
 
             time.sleep(0.2)
 
-        # Wait a moment for any final messages to propagate
-        print("\n--- Waiting for protocol to settle ---")
+        # Wait for protocol to settle
         time.sleep(2.0)
 
         # Collect logs and status at end of set
-        print("\n--- Collecting node logs and status ---")
         NODE_MESSAGE_LOGS = collect_node_logs(node_inboxes, driver_reply_queue)
         node_status_cache = collect_node_status(node_inboxes, driver_reply_queue)
         NEW_VIEW_MESSAGES = collect_new_view_messages(node_inboxes, driver_reply_queue)
-        
-        print(f"Collected logs from {len(NODE_MESSAGE_LOGS)} nodes")
-        print(f"Collected status for {len(node_status_cache)} sequences")
-        print(f"Collected {len(NEW_VIEW_MESSAGES)} NEW-VIEW messages")
 
         # Print final state
         print(f"\n=== Set {sid} Complete ===")
         time.sleep(0.5)
-        print("\nFinal state after set:")
-        PrintDB(monitor_db, applied_set)
-
-        # Post-set interactive menu (only menu, removed pre-set menu)
+        
+        # Post-set interactive menu
         print(f"\nSet {sid} complete. Commands: [Enter=next set, PrintDB, PrintLog <n>, PrintStatus <n>, PrintView, quit]")
         
         while True:

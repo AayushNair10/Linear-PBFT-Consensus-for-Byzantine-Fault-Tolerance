@@ -1,14 +1,3 @@
-# node.py - Node with attack_map support (dark & time attacks enabled)
-"""
-Node process updated to accept serialized attack_map via RESET messages.
-
-Key changes:
-- Node holds self.attack_map: Dict[node_id -> AttackConfig]
-- handle_reset accepts 'attack_map' in RESET envelope and reconstructs AttackConfig objects
-- start_request_timer consults self.attack_map[leader_id] to extend timers when leader has time attack
-- multicast_with_authenticator and send_to_node consult self.attack_config for dark/time behavior
-"""
-
 import json
 import time
 import threading
@@ -60,7 +49,6 @@ class Node:
         self.monitor_queue = monitor_queue
         self.readiness_queue = readiness_queue
 
-        # Message log for PrintLog - stores all protocol messages
         self.message_log: List[Dict[str, Any]] = []
         self.message_log_lock = threading.Lock()
 
@@ -80,17 +68,18 @@ class Node:
 
         self.datastore: Dict[str, int] = {}
         self.timer = None
-        self.timer_timeout = base_timer + float(self.id)  # base + node id offset
-        self.view_change_timer = None  # Timer for waiting for NEW-VIEW
-        self.view_change_timeout = 12.0  # 12 seconds to wait for NEW-VIEW
+        self.timer_timeout = base_timer + float(self.id)
+        self.view_change_timer = None
+        self.view_change_timeout = 8.0 #12
         self.target_view = None
+
+        self.deferred_client_requests = []
+        self.deferred_executions = set()
 
         self._stop = threading.Event()
         self.active = True
 
-        # Attack config: initial default; will be set properly on RESET when driver sends attack_map
-        self.attack_config: AttackConfig = get_attack_config(self.id)  # fallback
-        # attack_map: dict node_id -> AttackConfig (local copies)
+        self.attack_config: AttackConfig = get_attack_config(self.id)
         self.attack_map: Dict[int, AttackConfig] = {}
 
         self.reset_datastore()
@@ -98,21 +87,14 @@ class Node:
         try:
             self._broadcast_auth_init()
             time.sleep(0.05)
-        except Exception as e:
-            self.log_event(f"Auth-init broadcast exception: {e}")
+        except Exception:
+            pass
 
         if self.readiness_queue is not None:
             try:
                 self.readiness_queue.put({"type": "NODE_READY", "node": self.id})
-                self.log_event(f"Sent NODE_READY (Byzantine={self.attack_config.is_byzantine})")
             except Exception:
-                self.log_event("Failed to send NODE_READY")
-
-    def log_event(self, s: str):
-        """Timestamped event logging."""
-        ts = time.time()
-        prefix = "[BYZ]" if getattr(self.attack_config, "is_byzantine", False) else ""
-        print(f"[Node {self.id} | view {self.view}]{prefix} {s}")
+                pass
 
     def log_message(self, msg_type: str, msg: Dict[str, Any], direction: str = "SENT"):
         """Log protocol messages for PrintLog."""
@@ -120,7 +102,7 @@ class Node:
             log_entry = {
                 "timestamp": time.time(),
                 "type": msg_type,
-                "direction": direction,  # "SENT", "RECEIVED", "PROCESSED"
+                "direction": direction,
                 "view": msg.get("v", self.view),
                 "seq": msg.get("seq", None),
                 "digest": msg.get("d", None),
@@ -142,7 +124,6 @@ class Node:
         for i in range(10):
             name = chr(ord("A") + i)
             self.datastore[name] = 10
-        self.log_event("Datastore reset to initial balances (10 each)")
 
     def _broadcast_auth_init(self):
         """Broadcast AUTH_INIT with authenticator to other replicas (exclude self)."""
@@ -151,44 +132,30 @@ class Node:
         msg_bytes = json.dumps(msg, sort_keys=True).encode("utf-8")
         auth = create_authenticator(self.keyring, self.id, recipients, msg_bytes)
 
-        # ATTACK: Corrupt signatures if sign attack (if configured)
         if getattr(self.attack_config, "sign_attack", False):
             auth = self.attack_config.corrupt_signature(auth)
-            self.log_event("🔴 ATTACK: Corrupted AUTH_INIT signatures")
 
         envelope = {"msg": msg, "auth": auth, "sender": self.id}
-        sent = 0
 
         for r in recipients:
-            # ATTACK: dark drop if configured
             if getattr(self.attack_config, "dark_attack", False) and r in getattr(self.attack_config, "dark_targets", set()):
-                self.log_event(f"🔴 ATTACK: Dropped AUTH_INIT to node {r} (dark)")
                 continue
             q = self.out_queues.get(r)
             if q:
                 q.put(envelope)
-                sent += 1
-        self.log_event(f"Broadcasted AUTH_INIT to {sent} replicas")
 
-    # -----------------------
-    # Timers
-    # -----------------------
     def start_request_timer(self):
         """Start the node's request timer if not already running."""
         if self.timer and self.timer.is_alive():
             return
 
         timeout = float(self.timer_timeout)
-        # If we have an attack_map (sent by driver), extend timer if leader has time_attack
         leader_id = leader_for_view(self.view, self.n)
         leader_cfg = self.attack_map.get(leader_id)
         if leader_cfg and getattr(leader_cfg, "time_attack", False):
-            # leader will delay per-phase; add 3x per-phase delay + margin
             total_delay_buffer = (3 * float(leader_cfg.time_delay_ms) / 1000.0) + 2.5
             timeout = timeout + total_delay_buffer
-            self.log_event(f"⏰ Extending timer to {timeout:.1f}s (leader {leader_id} has time attack: {leader_cfg.time_delay_ms}ms/phase)")
 
-        self.log_event(f"Starting request timer ({timeout:.1f}s)")
         self.timer = threading.Timer(timeout, self._on_timer_expiry)
         self.timer.daemon = True
         self.timer.start()
@@ -201,17 +168,14 @@ class Node:
             except Exception:
                 pass
             self.timer = None
-            self.log_event("Stopped request timer")
 
     def start_view_change_timer(self, target_view: int):
         """Start timer for waiting for NEW-VIEW (handles consecutive leader failures)."""
         if self.view_change_timer and self.view_change_timer.is_alive():
             return
         
-        # Store which view we're waiting for
         self.target_view = target_view
         
-        self.log_event(f"Starting view-change timer ({self.view_change_timeout:.1f}s) - waiting for NEW-VIEW for view {target_view}")
         self.view_change_timer = threading.Timer(self.view_change_timeout, self._on_view_change_timer_expiry)
         self.view_change_timer.daemon = True
         self.view_change_timer.start()
@@ -225,36 +189,26 @@ class Node:
                 pass
             self.view_change_timer = None
             self.target_view = None
-            self.log_event("Stopped view-change timer")
 
     def _on_view_change_timer_expiry(self):
         """Called when view-change timer expires (no NEW-VIEW received)."""
         if not self.in_view_change:
-            return  # Already resolved
+            return
         
-        # IMPORTANT: Increment from the target view we were waiting for, not self.view
-        # Because self.view is still the old view (we haven't entered the new one yet)
         next_target = self.target_view + 1 if self.target_view is not None else self.view + 2
         
-        self.log_event(f"⏰ View-change timer expired: NEW-VIEW for view {self.target_view} not received, starting view-change to view {next_target}")
         try:
-            # Start view-change for next view
             self.start_view_change(next_target)
-        except Exception as e:
-            self.log_event(f"Exception starting cascaded view-change: {e}")
+        except Exception:
+            pass
             
     def _on_timer_expiry(self):
         """Called when request timer expires."""
-        self.log_event(f"⏱️ Request timer expired in view {self.view}: initiating view-change")
         try:
             self.start_view_change(self.view + 1)
-        except Exception as e:
-            self.log_event(f"Exception starting view-change: {e}")
+        except Exception:
+            pass
 
-
-    # -----------------------
-    # Sending helpers (honest + attack behavior)
-    # -----------------------
     def multicast_with_authenticator(self, msg: Dict[str, Any], recipients: Optional[List[int]] = None, skip_time_delay: bool = False):
         """
         Multicast a message (authenticator vector) to recipients (exclude self).
@@ -265,42 +219,23 @@ class Node:
 
         recipients_to_send = [r for r in recipients if r != self.id]
 
-        # ATTACK: apply time delay before multicasting if configured on THIS node
         if not skip_time_delay and getattr(self.attack_config, "time_attack", False):
-            delay_s = float(self.attack_config.time_delay_ms) / 1000.0
-            self.log_event(f"🔴 ATTACK: Applying time delay of {self.attack_config.time_delay_ms}ms ({delay_s:.1f}s) before multicasting {msg.get('type')}")
             self.attack_config.apply_time_delay()
-            self.log_event(f"✓ Time delay complete, now sending {msg.get('type')}")
 
         msg_bytes = json.dumps(msg, sort_keys=True).encode("utf-8")
         auth = create_authenticator(self.keyring, self.id, recipients_to_send, msg_bytes)
 
-        # ATTACK: corrupt signatures if sign attack
         if getattr(self.attack_config, "sign_attack", False):
             auth = self.attack_config.corrupt_signature(auth)
-            self.log_event(f"🔴 ATTACK: Corrupted signatures for {msg.get('type')}")
 
         envelope = {"msg": msg, "auth": auth, "sender": self.id}
-        sent = 0
-        dropped = 0
-        dark_nodes = []
 
         for r in recipients_to_send:
-            # ATTACK: dark drop if configured on THIS node
             if getattr(self.attack_config, "dark_attack", False) and r in getattr(self.attack_config, "dark_targets", set()):
-                self.log_event(f"🔴 ATTACK: Dropped {msg.get('type')} to node {r} (dark)")
-                dropped += 1
-                dark_nodes.append(r)
                 continue
             q = self.out_queues.get(r)
             if q:
                 q.put(envelope)
-                sent += 1
-
-        if dropped > 0:
-            self.log_event(f"📤 Multicasted {msg.get('type')} seq={msg.get('seq','')} to {sent} replicas (🚫 dropped {dropped} to dark nodes: {dark_nodes})")
-        else:
-            self.log_event(f"📤 Multicasted {msg.get('type')} seq={msg.get('seq','')} to {sent} replicas")
 
     def send_to_node(self, target: int, msg: Dict[str, Any]):
         """Send a point-to-point message to another node with a single MAC."""
@@ -311,16 +246,12 @@ class Node:
         except Exception:
             envelope = {"msg": msg, "sender": self.id}
 
-        # ATTACK: Skip if dark attack targets this node (do this before sending)
         if self.attack_config.should_drop_message_to(target):
-            self.log_event(f"🔴 ATTACK: Dropped {msg.get('type')} to node {target} (dark)")
             return
 
-        # ATTACK: corrupt single-MAC if sign_attack is active (flip one bit of the MAC)
         if getattr(self.attack_config, "sign_attack", False) and "mac" in envelope:
             mac_val = envelope["mac"]
             corrupted = None
-            # bytes / bytearray -> flip last byte LSB
             if isinstance(mac_val, (bytes, bytearray)):
                 ba = bytearray(mac_val)
                 if len(ba) == 0:
@@ -329,7 +260,6 @@ class Node:
                     ba[-1] ^= 0x01
                 corrupted = bytes(ba)
             elif isinstance(mac_val, str):
-                # Try hex decode (common if mac was hex string); if decode fails mutate last char
                 try:
                     b = bytes.fromhex(mac_val)
                     ba = bytearray(b)
@@ -339,7 +269,6 @@ class Node:
                         ba[-1] ^= 0x01
                     corrupted = ba.hex()
                 except Exception:
-                    # fallback: flip low bit of last char code
                     if len(mac_val) == 0:
                         corrupted = "X"
                     else:
@@ -347,23 +276,17 @@ class Node:
                         newch = chr((last ^ 0x01) % 256)
                         corrupted = mac_val[:-1] + newch
             else:
-                # unknown type, set to an obviously-bad sentinel
                 corrupted = b"CORRUPT"
 
             envelope["mac"] = corrupted
-            self.log_event(f"🔴 ATTACK: Corrupted single-MAC for {msg.get('type')} -> target {target}")
 
         q = self.out_queues.get(target)
         if q:
             q.put(envelope)
-        else:
-            self.log_event(f"ERROR: No queue to send to node {target}")
 
     def send_to_client(self, client_id: int, msg: Dict[str, Any]):
         """Send a REPLY message to a client with a single MAC."""
-        # ATTACK: Crash attack - don't send replies
         if msg.get("type") == MSG_REPLY and self.attack_config.should_block_reply():
-            self.log_event(f"🔴 ATTACK: Crash - not sending REPLY to client {client_id}")
             return
 
         msg_bytes = json.dumps(msg, sort_keys=True).encode("utf-8")
@@ -373,7 +296,6 @@ class Node:
         except Exception:
             envelope = {"msg": msg, "sender": self.id}
 
-        # ATTACK: corrupt reply MAC if sign_attack is active (flip one bit)
         if getattr(self.attack_config, "sign_attack", False) and "mac" in envelope:
             mac_val = envelope["mac"]
             corrupted = None
@@ -404,18 +326,11 @@ class Node:
                 corrupted = b"CORRUPT"
 
             envelope["mac"] = corrupted
-            self.log_event(f"🔴 ATTACK: Corrupted single-MAC for REPLY to client {client_id}")
 
         q = self.client_queues.get(client_id)
         if q:
             q.put(envelope)
-            self.log_event(f"Sent REPLY to client {client_id}")
-        else:
-            self.log_event(f"ERROR: No client queue for client {client_id}")
 
-    # -----------------------
-    # Verification helpers
-    # -----------------------
     def verify_authenticator_for_self(self, envelope: Dict[str, Any]) -> bool:
         """Verify an incoming envelope that carries an authenticator vector."""
         if "auth" not in envelope:
@@ -424,8 +339,6 @@ class Node:
         msg = envelope.get("msg")
         msg_bytes = json.dumps(msg, sort_keys=True).encode("utf-8")
         ok = verify_authenticator(self.keyring, sender, self.id, msg_bytes, envelope.get("auth"))
-        if not ok:
-            self.log_event(f"Auth verification FAILED for {msg.get('type')} from {sender} (possible sign attack)")
         return ok
 
     def verify_single_mac_for_self(self, envelope: Dict[str, Any]) -> bool:
@@ -436,14 +349,8 @@ class Node:
         msg = envelope.get("msg")
         msg_bytes = json.dumps(msg, sort_keys=True).encode("utf-8")
         ok = verify_mac(self.keyring, sender, self.id, msg_bytes, envelope.get("mac"))
-        if not ok:
-            self.log_event(f"MAC verification FAILED for {msg.get('type')} from {sender}")
         return ok
 
-    # -----------------------
-    # Request handling and PBFT flow
-    # (unchanged logic except uses self.attack_config and self.attack_map)
-    # -----------------------
     def handle_request(self, envelope: Dict[str, Any]):
         """Handle client WRITE REQUEST."""
         if not self.active:
@@ -459,31 +366,24 @@ class Node:
             self.handle_read_request(envelope)
             return
 
-        self.log_event(f"📨 Received WRITE REQUEST from client {sender}")
         self.log_message("REQUEST", msg, "RECEIVED")
 
         if self.in_view_change:
-            self.log_event("In view-change: ignoring request")
+            if not hasattr(self, "deferred_client_requests"):
+                self.deferred_client_requests = []
+            self.deferred_client_requests.append(envelope)
             return
 
-        # NON-PRIMARY: Start timer to detect Byzantine/failed leader
         if self.id != leader_for_view(self.view, self.n):
-            self.log_event(f"Not leader (leader is {leader_for_view(self.view, self.n)}): waiting for PRE-PREPARE")
-
-            # Start timer if not already running - expecting PRE-PREPARE from leader
             if not self.in_view_change and not (self.timer and self.timer.is_alive()):
                 self.start_request_timer()
-                self.log_event("⏰ Started timer (expecting PRE-PREPARE from leader)")
-
             return
 
-        # PRIMARY: Check for duplicates
         request_key = (client_id, tstamp)
 
         with self.state_lock:
             if request_key in self.processed_requests:
                 existing_seq = self.processed_requests[request_key]
-                self.log_event(f"Duplicate request (seq={existing_seq}): ignoring")
 
                 existing_st = self.seq_state.get(existing_seq)
                 if existing_st and existing_st.get("executed"):
@@ -495,7 +395,6 @@ class Node:
 
         seq = self.next_seq
         if seq >= self.high:
-            self.log_event(f"Seq {seq} >= high {self.high}: dropping")
             return
         self.next_seq += 1
 
@@ -510,50 +409,37 @@ class Node:
                 "sent_prepare": False, "result": None
             })
             st["preprepare"] = {"view": self.view, "seq": seq, "digest": d, "request": msg, "sender": self.id}
-            # Leader adds its own prepare immediately
             st["prepares"][self.id] = {"type": MSG_PREPARE, "v": self.view, "seq": seq, "d": d, "i": self.id}
             st["sent_prepare"] = True
 
-        # ATTACK: Equivocation - send conflicting preprepares (handled here if configured)
         if getattr(self.attack_config, "equivocation_attack", False):
             self._handle_equivocation_attack(seq, msg, d)
         else:
-            # Normal flow - multicast will apply time delay if configured for this node
             preprepare_msg = {"type": MSG_PREPREPARE, "v": self.view, "seq": seq, "d": d, "m": msg}
             self.multicast_with_authenticator(preprepare_msg)
             self.log_message("PREPREPARE", preprepare_msg, "SENT")
-            self.log_event(f"👑 Leader multicasted PREPREPARE seq={seq}")
 
     def _handle_equivocation_attack(self, base_seq: int, msg: Dict, digest: str):
         """
         ATTACK: Equivocation - send conflicting preprepares to different nodes.
-        Send base_seq to some nodes and base_seq+1 to equivocation targets.
         """
-        self.log_event(f"🔴 ATTACK: Equivocation - sending seq={base_seq} and seq={base_seq+1}")
-
         all_recipients = [r for r in list(self.out_queues.keys()) if r != self.id]
 
         for target in all_recipients:
             if target in getattr(self.attack_config, "equivocation_targets", []):
-                # Send conflicting preprepare with seq+1
                 alt_seq = base_seq + 1
                 preprepare_msg = {"type": MSG_PREPREPARE, "v": self.view, "seq": alt_seq, "d": digest, "m": msg}
-                self.log_event(f"🔴 ATTACK: Sending PREPREPARE seq={alt_seq} to node {target}")
             else:
-                # Send normal preprepare
                 preprepare_msg = {"type": MSG_PREPREPARE, "v": self.view, "seq": base_seq, "d": digest, "m": msg}
 
-            # Send individually
             msg_bytes = json.dumps(preprepare_msg, sort_keys=True).encode("utf-8")
             auth = create_authenticator(self.keyring, self.id, [target], msg_bytes)
 
-            # ATTACK: Corrupt signature if sign attack also active
             if getattr(self.attack_config, "sign_attack", False):
                 auth = self.attack_config.corrupt_signature(auth)
 
             envelope = {"msg": preprepare_msg, "auth": auth, "sender": self.id}
 
-            # ATTACK: Skip if dark attack targets this node
             if getattr(self.attack_config, "dark_attack", False) and target in getattr(self.attack_config, "dark_targets", set()):
                 continue
 
@@ -561,7 +447,6 @@ class Node:
             if q:
                 q.put(envelope)
 
-    # --- PREPARE / PREPARE_MULTICAST / COMMIT flows (unchanged but they use attack_config when sending) ---
     def handle_preprepare(self, envelope: Dict[str, Any]):
         """Backup receives PRE-PREPARE from leader."""
         if not self.active:
@@ -577,20 +462,15 @@ class Node:
         m = msg.get("m")
         leader = envelope.get("sender")
 
-        self.log_event(f"📩 Received PREPREPARE seq={seq} from leader {leader}")
         self.log_message("PREPREPARE", msg, "RECEIVED")
 
         if self.in_view_change:
-            self.log_event("In view-change: ignoring")
             return
         if v != self.view:
-            self.log_event(f"View mismatch: {v} != {self.view}")
             return
         if seq < self.low or seq >= self.high:
-            self.log_event(f"Seq {seq} outside window [{self.low},{self.high})")
             return
         if sha256_digest(m) != d:
-            self.log_event("Digest mismatch")
             return
 
         with self.state_lock:
@@ -601,25 +481,19 @@ class Node:
             })
             st["preprepare"] = {"view": v, "seq": seq, "digest": d, "request": m, "sender": leader}
 
-            # ATTACK: Crash attack - backup doesn't send prepare
-            if getattr(self.attack_config, "crash_attack", False) and self.attack_config.should_block_prepare(False):
-                self.log_event(f"🔴 ATTACK: Crash - not sending PREPARE for seq={seq}")
-                st["sent_prepare"] = True  # Mark as sent to prevent resend
-                return
-
-            if not st.get("sent_prepare", False):
-                prepare_msg = {"type": MSG_PREPARE, "v": v, "seq": seq, "d": d, "i": self.id}
-                leader_id = leader_for_view(self.view, self.n)
-                self.send_to_node(leader_id, prepare_msg)
-                self.log_message("PREPARE", prepare_msg, "SENT")
+            if getattr(self.attack_config, "crash_attack", False) and getattr(self.attack_config, "should_send_preprepare_only", None) and self.attack_config.should_send_preprepare_only():
                 st["sent_prepare"] = True
-                self.log_event(f"Sent PREPARE to leader {leader_id} for seq={seq}")
+            else:
+                if not st.get("sent_prepare", False):
+                    prepare_msg = {"type": MSG_PREPARE, "v": v, "seq": seq, "d": d, "i": self.id}
+                    leader_id = leader_for_view(self.view, self.n)
+                    self.send_to_node(leader_id, prepare_msg)
+                    self.log_message("PREPARE", prepare_msg, "SENT")
+                    st["sent_prepare"] = True
 
-        # Reset timer - received PRE-PREPARE from leader (leader is alive)
         if not self.in_view_change:
             self.stop_request_timer()
             self.start_request_timer()
-            self.log_event("⏰ Reset timer (now waiting for execution)")
 
     def handle_prepare_point_to_point(self, envelope: Dict[str, Any]):
         """Leader receives PREPARE from a backup."""
@@ -633,7 +507,6 @@ class Node:
         seq = msg.get("seq")
         i = msg.get("i")
 
-        self.log_event(f"📨 Leader received PREPARE from node {i} for seq={seq}")
         self.log_message("PREPARE", msg, "RECEIVED")
 
         with self.state_lock:
@@ -653,9 +526,7 @@ class Node:
         if self.id != leader_for_view(self.view, self.n):
             return
 
-        # ATTACK: Crash attack - leader doesn't send prepare_multicast
         if getattr(self.attack_config, "crash_attack", False) and self.attack_config.should_block_prepare(True):
-            self.log_event(f"🔴 ATTACK: Crash - blocking PREPARE_MULTICAST for seq={seq}")
             return
 
         pm = None
@@ -670,8 +541,6 @@ class Node:
             prepares = st["prepares"]
             num_prepares = len(prepares)
 
-            self.log_event(f"👑 Leader has {num_prepares} prepares for seq={seq} (need {2*F+1})")
-
             if num_prepares >= (2 * F + 1):
                 pm_list = list(prepares.values())
                 d = st["preprepare"]["digest"]
@@ -679,17 +548,14 @@ class Node:
                 st["prepare_multicast"] = prepare_multicast
                 st["status"] = "P"
 
-                # Leader adds its own commit BEFORE multicasting
                 commit_msg = {"type": MSG_COMMIT, "v": self.view, "seq": seq, "d": d, "i": self.id}
                 st["commits"][self.id] = commit_msg
 
                 pm = prepare_multicast
-                self.log_event(f"👑 Leader ready to multicast PREPARE_MULTICAST for seq={seq} with {num_prepares} prepares")
 
         if pm is not None:
             self.multicast_with_authenticator(pm)
             self.log_message("PREPARE_MULTICAST", pm, "SENT")
-            self.log_event(f"👑 Leader multicasted PREPARE_MULTICAST and added self-commit for seq={seq}")
 
     def handle_prepare_multicast(self, envelope: Dict[str, Any]):
         """Backup receives PREPARE_MULTICAST."""
@@ -705,11 +571,9 @@ class Node:
         d = msg.get("d")
         prepares = msg.get("prepares", [])
 
-        self.log_event(f"📩 Received PREPARE_MULTICAST seq={seq} with {len(prepares)} prepares")
         self.log_message("PREPARE_MULTICAST", msg, "RECEIVED")
 
         if v != self.view:
-            self.log_event("View mismatch")
             return
 
         with self.state_lock:
@@ -723,16 +587,13 @@ class Node:
                 pid = p.get("i")
                 st["prepares"][pid] = p
 
-        # ATTACK: Crash attack - backup doesn't send commit
-        if getattr(self.attack_config, "crash_attack", False) and self.attack_config.should_block_commit(False):
-            self.log_event(f"🔴 ATTACK: Crash - not sending COMMIT for seq={seq}")
+        if getattr(self.attack_config, "crash_attack", False) and getattr(self.attack_config, "should_send_preprepare_only", None) and self.attack_config.should_send_preprepare_only():
             return
 
         commit_msg = {"type": MSG_COMMIT, "v": v, "seq": seq, "d": d, "i": self.id}
         leader_id = leader_for_view(self.view, self.n)
         self.send_to_node(leader_id, commit_msg)
         self.log_message("COMMIT", commit_msg, "SENT")
-        self.log_event(f"Sent COMMIT to leader {leader_id} for seq={seq}")
 
     def handle_commit_point_to_point(self, envelope: Dict[str, Any]):
         """Leader receives COMMIT from a backup."""
@@ -746,7 +607,6 @@ class Node:
         seq = msg.get("seq")
         i = msg.get("i")
 
-        self.log_event(f"📨 Leader received COMMIT from node {i} for seq={seq}")
         self.log_message("COMMIT", msg, "RECEIVED")
 
         with self.state_lock:
@@ -766,9 +626,7 @@ class Node:
         if self.id != leader_for_view(self.view, self.n):
             return
 
-        # ATTACK: Crash attack - leader doesn't send commit_multicast
         if getattr(self.attack_config, "crash_attack", False) and self.attack_config.should_block_commit(True):
-            self.log_event(f"🔴 ATTACK: Crash - blocking COMMIT_MULTICAST for seq={seq}")
             return
 
         cm = None
@@ -783,8 +641,6 @@ class Node:
             commits = st["commits"]
             num_commits = len(commits)
 
-            self.log_event(f"👑 Leader has {num_commits} commits for seq={seq} (need {2*F+1})")
-
             if num_commits >= (2 * F + 1):
                 cm_list = list(commits.values())
                 d = st["preprepare"]["digest"]
@@ -793,14 +649,10 @@ class Node:
                 st["status"] = "C"
 
                 cm = commit_multicast
-                self.log_event(f"👑 Leader ready to multicast COMMIT_MULTICAST for seq={seq} with {num_commits} commits")
 
         if cm is not None:
             self.multicast_with_authenticator(cm)
             self.log_message("COMMIT_MULTICAST", cm, "SENT")
-            self.log_event(f"👑 Leader multicasted COMMIT_MULTICAST for seq={seq}")
-
-            # Try to execute immediately
             self._try_to_execute(seq)
 
     def handle_commit_multicast(self, envelope: Dict[str, Any]):
@@ -817,11 +669,9 @@ class Node:
         d = msg.get("d")
         commits = msg.get("commits", [])
 
-        self.log_event(f"📩 Received COMMIT_MULTICAST seq={seq} with {len(commits)} commits")
         self.log_message("COMMIT_MULTICAST", msg, "RECEIVED")
 
         if v != self.view:
-            self.log_event("View mismatch")
             return
 
         with self.state_lock:
@@ -848,13 +698,10 @@ class Node:
                 return
 
             if st.get("preprepare") is None:
-                self.log_event(f"Cannot execute seq={seq}: missing preprepare")
                 return
             if st.get("prepare_multicast") is None:
-                self.log_event(f"Cannot execute seq={seq}: missing prepare_multicast")
                 return
             if st.get("commit_multicast") is None:
-                self.log_event(f"Cannot execute seq={seq}: missing commit_multicast")
                 return
 
             d1 = st["preprepare"]["digest"]
@@ -862,7 +709,6 @@ class Node:
             d3 = st["commit_multicast"]["d"]
 
             if not (d1 == d2 == d3):
-                self.log_event(f"Digest mismatch for seq={seq}")
                 return
 
             req = st["preprepare"]["request"]
@@ -879,24 +725,19 @@ class Node:
                     self.datastore[sname] -= amt
                     self.datastore[rname] = self.datastore.get(rname, 0) + amt
                     result = {"status": "EXECUTED", "detail": f"{sname}->{rname}:{amt}"}
-                    self.log_event(f"✅ EXECUTED seq={seq}: {sname}->{rname}:{amt}")
                 else:
                     result = {"status": "FAILED", "detail": "insufficient"}
-                    self.log_event(f"❌ FAILED seq={seq}: insufficient balance")
             else:
                 sname = op.get("s")
                 result = {"status": "EXECUTED", "balance": self.datastore.get(sname, 0)}
-                self.log_event(f"✅ EXECUTED seq={seq}: balance query")
 
             st["executed"] = True
             st["status"] = "E"
             st["result"] = result
 
-        # Log execution
         exec_msg = {"seq": seq, "result": result, "v": self.view}
         self.log_message("EXECUTE", exec_msg, "PROCESSED")
 
-        # Send reply and update monitor
         reply_msg = {"type": MSG_REPLY, "v": self.view, "t": tstamp, "c": client_id, "i": self.id, "r": result}
         self.send_to_client(client_id, reply_msg)
         self.log_message("REPLY", reply_msg, "SENT")
@@ -908,12 +749,9 @@ class Node:
                 snapshot = dict(self.datastore)
                 self.monitor_queue.put({"type": "EXECUTED_NOTIFY", "t": tstamp, "node": self.id, "seq": seq, "op": op, "result": result})
                 self.monitor_queue.put({"type": "DB_SNAPSHOT", "node": self.id, "seq": seq, "db": snapshot, "t": tstamp})
-            except Exception as e:
-                self.log_event(f"Failed to send to monitor: {e}")
+            except Exception:
+                pass
 
-    # -----------------------
-    # Read handling
-    # -----------------------
     def handle_read_request(self, envelope: Dict[str, Any]):
         """Handle read request by replying immediately (to client) with local state."""
         if not self.active:
@@ -931,28 +769,19 @@ class Node:
             reply_msg = {"type": MSG_REPLY, "v": self.view, "t": tstamp, "c": client_id, "i": self.id, "r": result}
             self.send_to_client(client_id, reply_msg)
 
-    # -----------------------
-    # View-change logic (unchanged except behaviour reading self.view_change_msgs)
-    # -----------------------
     def start_view_change(self, target_view: int):
         """Initiate view-change (originating node multicasts VIEW-CHANGE)."""
         if not self.active:
             return
 
         self.stop_request_timer()
-        # Start the view-change timer for the new target view
         self.start_view_change_timer(target_view)
 
-        # IMPORTANT FIX: Check if we already sent VIEW-CHANGE for THIS target_view
-        # Don't just check in_view_change flag - that blocks cascading view-changes
         with self.state_lock:
             if self.id in self.view_change_msgs.get(target_view, {}):
-                self.log_event(f"Already sent VIEW-CHANGE for view {target_view}")
                 return
 
-        # Now set the flag (we're starting a new view-change)
         self.in_view_change = True
-        self.log_event(f"🔄 Starting view-change to view {target_view}")
 
         with self.state_lock:
             P = []
@@ -967,27 +796,26 @@ class Node:
                     P.append(pm)
 
             view_change_msg = {"type": "VIEW_CHANGE", "v": target_view, "n": self.low, "C": [], "P": P, "i": self.id}
-            # record own view-change
             self.view_change_msgs.setdefault(target_view, {})[self.id] = view_change_msg
 
-        # Originating node multicasts VIEW-CHANGE to inform all replicas that VC process started
-        self.multicast_with_authenticator(view_change_msg)
-        self.log_event(f"✅ Multicasted VIEW-CHANGE for view {target_view} with {len(P)} P-entries")
+        if getattr(self.attack_config, "crash_attack", False) and getattr(self.attack_config, "should_send_preprepare_only", None) and self.attack_config.should_send_preprepare_only():
+            return
 
+        failed_leader = leader_for_view(self.view, self.n)
+        recipients = [nid for nid in list(self.out_queues.keys()) if nid != failed_leader]
+
+        self.multicast_with_authenticator(view_change_msg, recipients=recipients)
 
     def _delayed_view_change(self, target_view: int):
         """Delayed view-change to avoid message storms."""
-        self.log_event(f"_delayed_view_change triggered for view {target_view}")
         time.sleep(0.1)
         with self.state_lock:
             if self.id in self.view_change_msgs.get(target_view, {}):
-                self.log_event(f"Already sent VIEW-CHANGE for view {target_view}, skipping")
                 return
-        self.log_event(f"Calling start_view_change for view {target_view}")
         self.start_view_change(target_view)
 
     def handle_view_change(self, envelope: Dict[str, Any]):
-        """Process VIEW_CHANGE messages (logic unchanged from your last working version)."""
+        """Process VIEW_CHANGE messages."""
         if not self.active:
             return
 
@@ -1006,19 +834,16 @@ class Node:
         if target_view <= self.view:
             return
 
-        self.log_event(f"Received/Observed VIEW-CHANGE for view {target_view} from {sender}")
-
         self.stop_request_timer()
-        # ADD THIS LINE:
         self.start_view_change_timer(target_view)
         self.in_view_change = True
 
         with self.state_lock:
             self.view_change_msgs.setdefault(target_view, {})[sender] = msg
 
-        # If we haven't sent own VC for target, send to new leader (point-to-point)
         with self.state_lock:
             already_sent = (self.id in self.view_change_msgs.get(target_view, {}))
+
         if not already_sent:
             P = []
             with self.state_lock:
@@ -1029,37 +854,33 @@ class Node:
                     prepares = st.get("prepares", {})
                     if pre is not None and len(prepares) >= (2 * F + 1):
                         pm = {"seq": seq, "view": pre.get("view"), "digest": pre.get("digest"),
-                              "prepares": list(prepares.values()), "request": pre.get("request", None)}
+                            "prepares": list(prepares.values()), "request": pre.get("request", None)}
                         P.append(pm)
                 our_vc_msg = {"type": "VIEW_CHANGE", "v": target_view, "n": self.low, "C": [], "P": P, "i": self.id}
                 self.view_change_msgs.setdefault(target_view, {})[self.id] = our_vc_msg
 
-            leader_id = leader_for_view(target_view, self.n)
-            # send point-to-point to leader
-            self.send_to_node(leader_id, our_vc_msg)
-            self.log_event(f"Observed VIEW-CHANGE for higher view {target_view}; sent our VIEW-CHANGE to leader {leader_id}")
+            if getattr(self.attack_config, "crash_attack", False) and getattr(self.attack_config, "should_send_preprepare_only", None) and self.attack_config.should_send_preprepare_only():
+                pass
+            else:
+                leader_id = leader_for_view(target_view, self.n)
+                recipients_node_ids = [r for r in list(self.out_queues.keys()) if r != leader_id and r != self.id]
+
+                self.multicast_with_authenticator(our_vc_msg, recipients=recipients_node_ids)
 
         new_leader = leader_for_view(target_view, self.n)
         if new_leader == self.id:
             with self.state_lock:
                 num_vc_msgs = len(self.view_change_msgs.get(target_view, {}))
-            self.log_event(f"👑 I am the new leader for view {target_view}! Have {num_vc_msgs}/{2*F+1} VIEW-CHANGEs")
             if num_vc_msgs >= (2 * F + 1):
-                self.log_event(f"✅ Forming NEW-VIEW for view {target_view}")
                 self._form_and_multicast_new_view(target_view)
-            else:
-                self.log_event(f"⏳ Waiting for more VIEW-CHANGEs ({num_vc_msgs}/{2*F+1})")
 
     def _form_and_multicast_new_view(self, target_view: int):
-        """Form NEW-VIEW and multicast (same approach as your working version)."""
+        """Form NEW-VIEW and multicast."""
         if getattr(self.attack_config, "crash_attack", False) and self.attack_config.should_block_newview():
-            self.log_event(f"🔴 ATTACK: Crash - not sending NEW-VIEW for view {target_view}")
             return
 
         with self.state_lock:
             V_msgs = list(self.view_change_msgs.get(target_view, {}).values())
-
-        self.log_event(f"Forming NEW-VIEW with {len(V_msgs)} VIEW-CHANGE messages")
 
         min_s = max(vc.get("n", 0) for vc in V_msgs) if V_msgs else 0
 
@@ -1072,8 +893,6 @@ class Node:
                 if seq > max_s:
                     max_s = seq
                 seq_to_P_entries.setdefault(seq, []).append(pentry)
-
-        self.log_event(f"NEW-VIEW range: min-s={min_s}, max-s={max_s}")
 
         O = []
         for seq in range(min_s + 1, max_s + 1):
@@ -1094,7 +913,6 @@ class Node:
                     "m": request
                 }
                 O.append(preprepare_entry)
-                self.log_event(f"O: seq={seq} from view {best_entry.get('view')} (real request)")
             else:
                 null_request = {"type": "NULL_REQUEST", "seq": seq}
                 dnull = sha256_digest(null_request)
@@ -1105,16 +923,13 @@ class Node:
                     "m": None
                 }
                 O.append(preprepare_entry)
-                self.log_event(f"O: seq={seq} null request (no prepare in V)")
 
         new_view_msg = {"type": "NEW_VIEW", "v": target_view, "V": V_msgs, "O": O, "i": self.id}
         self.multicast_with_authenticator(new_view_msg)
-        self.log_event(f"📢 Multicasted NEW-VIEW for view {target_view} with {len(O)} pre-prepares")
 
         with self.state_lock:
             self.new_view_msgs.append(new_view_msg)
 
-        # Primary installs the new view locally
         self._install_new_view_local(new_view_msg)
 
     def _install_new_view_local(self, new_view_msg: Dict[str, Any]):
@@ -1125,9 +940,7 @@ class Node:
         self.view = target_view
         self.in_view_change = False
         self.stop_request_timer()
-        
         self.stop_view_change_timer()
-        self.log_event(f"Installed NEW-VIEW, now in view {self.view}")
 
         with self.state_lock:
             for pre in O:
@@ -1148,10 +961,18 @@ class Node:
             seq = int(pre.get("seq"))
             self._try_to_multicast_prepare(seq)
 
+        if not hasattr(self, "deferred_client_requests"):
+            self.deferred_client_requests = []
+
+        while self.deferred_client_requests:
+            env = self.deferred_client_requests.pop(0)
+            try:
+                self.handle_request(env)
+            except Exception:
+                pass
+
     def handle_new_view(self, envelope: Dict[str, Any]):
-        """
-        Process NEW-VIEW from primary (validation: at least 2f+1 view-change msgs).
-        """
+        """Process NEW-VIEW from primary."""
         if not self.active:
             return
 
@@ -1164,13 +985,8 @@ class Node:
         O = msg.get("O", [])
         primary = envelope.get("sender")
 
-        self.log_event(f"📨 Received NEW-VIEW for view {target_view} from primary {primary}")
-
         if len(V_msgs) < (2 * F + 1):
-            self.log_event(f"❌ NEW-VIEW rejected: only {len(V_msgs)} VIEW-CHANGEs (need {2*F+1})")
             return
-
-        self.log_event(f"✅ NEW-VIEW validated: {len(V_msgs)} VIEW-CHANGEs, {len(O)} pre-prepares")
 
         with self.state_lock:
             self.new_view_msgs.append(msg)
@@ -1194,14 +1010,11 @@ class Node:
                         "sender": primary
                     }
 
-        # Enter the new view
         self.view = target_view
         self.in_view_change = False
         self.stop_request_timer()
         self.stop_view_change_timer()
-        self.log_event(f"🎉 Entered view {self.view} with primary {leader_for_view(self.view, self.n)}")
 
-        # Send PREPARE messages for all entries in O to the new primary
         with self.state_lock:
             for seq, st in list(self.seq_state.items()):
                 pre = st.get("preprepare")
@@ -1210,9 +1023,7 @@ class Node:
                         v = pre.get("view")
                         d = pre.get("digest")
 
-                        # Skip null requests
                         if pre.get("request") is None:
-                            self.log_event(f"Skipping null request at seq={seq}")
                             continue
 
                         prepare_msg = {"type": MSG_PREPARE, "v": v, "seq": seq, "d": d, "i": self.id}
@@ -1220,13 +1031,18 @@ class Node:
                         self.send_to_node(leader_id, prepare_msg)
                         self.log_message("PREPARE", prepare_msg, "SENT")
                         st["sent_prepare"] = True
-                        self.log_event(f"Sent PREPARE to new leader {leader_id} for seq={seq}")
 
-    # -----------------------
-    # RESET and installing attack_map
-    # -----------------------
+        if not hasattr(self, "deferred_client_requests"):
+            self.deferred_client_requests = []
+
+        while self.deferred_client_requests:
+            env = self.deferred_client_requests.pop(0)
+            try:
+                self.handle_request(env)
+            except Exception:
+                pass
+
     def handle_reset(self, envelope: Dict[str, Any]):
-        # cancel any running timers to avoid old timeouts firing
         try:
             self.stop_request_timer()
         except Exception:
@@ -1238,11 +1054,9 @@ class Node:
             pass
 
         if not self.active:
-            # even if paused, do not ignore RESET so driver can resume state
             pass
 
         msg = envelope.get("msg", {})
-        # install attack_map if present
         attack_map_raw = msg.get("attack_map")
         if attack_map_raw and isinstance(attack_map_raw, dict):
             self.attack_map = {}
@@ -1250,29 +1064,20 @@ class Node:
                 try:
                     nid = int(k)
                 except Exception:
-                    # keys might already be ints
                     nid = int(k)
-                # v is a serializable dict -> reconstruct AttackConfig
                 try:
                     ac = AttackConfig.from_dict(v)
                 except Exception:
                     ac = AttackConfig(nid)
                 self.attack_map[nid] = ac
-            # set local attack_config for this node
             self.attack_config = self.attack_map.get(self.id, AttackConfig(self.id))
-            self.log_event(f"Installed attack_map; My config: {self.attack_config}")
         else:
-            # fallback to whatever get_attack_config returns (likely default)
             self.attack_config = get_attack_config(self.id)
             self.attack_map = {self.id: self.attack_config}
-            self.log_event(f"No attack_map in RESET; using get_attack_config: (Byzantine={self.attack_config.is_byzantine})")
 
-        # reset state
         self.reset_datastore()
         self.in_view_change = False
         self.view = 0
-        
-        # IMPORTANT: Reset sequence number to 1 (not 0)
         self.next_seq = 1
         self.low = 0
         self.high = self.low + WINDOW_SIZE
@@ -1283,13 +1088,8 @@ class Node:
             self.view_change_msgs.clear()
             self.new_view_msgs.clear()
 
-        # Clear message log for new set
         with self.message_log_lock:
             self.message_log.clear()
-
-        self.log_event(f"Reset complete - sequence starts at {self.next_seq} (Byzantine={self.attack_config.is_byzantine})")
-
-
 
     def handle_get_log(self, envelope: Dict[str, Any]):
         """Handle GET_LOG request from driver - return message log."""
@@ -1299,7 +1099,6 @@ class Node:
         if reply_queue is None:
             return
         
-        # Return a copy of the message log
         try:
             log_copy = self.get_message_log()
             response = {
@@ -1308,10 +1107,8 @@ class Node:
                 "log": log_copy
             }
             reply_queue.put(response)
-            self.log_event(f"Sent message log to driver ({len(log_copy)} entries)")
-        except Exception as e:
-            self.log_event(f"Error sending log to driver: {e}")
-
+        except Exception:
+            pass
 
     def handle_get_status(self, envelope: Dict[str, Any]):
         """Handle GET_STATUS request from driver - return sequence statuses."""
@@ -1321,7 +1118,6 @@ class Node:
         if reply_queue is None:
             return
         
-        # Collect status for all sequences
         statuses = {}
         with self.state_lock:
             for seq, st in self.seq_state.items():
@@ -1335,10 +1131,8 @@ class Node:
                 "statuses": statuses
             }
             reply_queue.put(response)
-            self.log_event(f"Sent status for {len(statuses)} sequences to driver")
-        except Exception as e:
-            self.log_event(f"Error sending status to driver: {e}")
-
+        except Exception:
+            pass
 
     def handle_get_new_view(self, envelope: Dict[str, Any]):
         """Handle GET_NEW_VIEW request from driver - return NEW-VIEW messages."""
@@ -1348,7 +1142,6 @@ class Node:
         if reply_queue is None:
             return
         
-        # Return copy of new_view_msgs
         try:
             with self.state_lock:
                 nv_copy = list(self.new_view_msgs)
@@ -1359,16 +1152,11 @@ class Node:
                 "new_view_msgs": nv_copy
             }
             reply_queue.put(response)
-            self.log_event(f"Sent {len(nv_copy)} NEW-VIEW messages to driver")
-        except Exception as e:
-            self.log_event(f"Error sending NEW-VIEW to driver: {e}")
+        except Exception:
+            pass
 
-    # -----------------------
-    # Main loop
-    # -----------------------
     def run(self):
         """Main event loop."""
-        self.log_event("Node starting")
         while not self._stop.is_set():
             try:
                 envelope = self.inbox.get(timeout=0.5)
@@ -1380,7 +1168,6 @@ class Node:
             msg = envelope.get("msg", {})
             mtype = msg.get("type")
 
-            # Handle PAUSE/UNPAUSE
             if mtype == "PAUSE":
                 if self.active:
                     try:
@@ -1388,25 +1175,20 @@ class Node:
                     except Exception:
                         pass
                     self.active = False
-                    self.log_event("PAUSED (simulated down)")
                 continue
             if mtype == "UNPAUSE":
                 if not self.active:
                     self.active = True
-                    self.log_event("UNPAUSED (resuming)")
                 continue
 
-            # Handle AUTH_INIT
             if mtype == "AUTH_INIT":
                 if self.verify_authenticator_for_self(envelope):
-                    self.log_event(f"Verified AUTH_INIT from {envelope.get('sender')}")
+                    pass
                 continue
 
-            # While in view-change only accept VC / NEW_VIEW / RESET
             if self.in_view_change and mtype not in ("VIEW_CHANGE", "NEW_VIEW", "RESET", "GET_LOG", "GET_STATUS", "GET_NEW_VIEW"):
                 continue
 
-            # Handle protocol messages
             if mtype == MSG_REQUEST:
                 op = msg.get("op", {})
                 if op.get("type") == "read":
@@ -1430,16 +1212,12 @@ class Node:
                 self.handle_new_view(envelope)
             elif mtype == "RESET":
                 self.handle_reset(envelope)
-            
-            # ADD THESE NEW HANDLERS:
             elif mtype == "GET_LOG":
                 self.handle_get_log(envelope)
             elif mtype == "GET_STATUS":
                 self.handle_get_status(envelope)
             elif mtype == "GET_NEW_VIEW":
                 self.handle_get_new_view(envelope)
-
-        self.log_event("Node stopped")
 
     def stop(self):
         """Stop the node."""

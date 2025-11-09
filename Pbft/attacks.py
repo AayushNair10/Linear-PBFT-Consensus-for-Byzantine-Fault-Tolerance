@@ -31,26 +31,22 @@ class AttackConfig:
 
         # Concrete attack toggles
         self.sign_attack: bool = False
-        self.crash_attack: bool = False   # logical crash (driver should PAUSE it)
+        self.crash_attack: bool = False
         self.dark_attack: bool = False
         self.time_attack: bool = False
         self.equivocation_attack: bool = False
 
         # Parameters
         self.dark_targets: Set[int] = set()
-        # Default time delay for time attack: 1000 ms (1 second) per multicast phase
         self.time_delay_ms: float = 1000.0
         self.equivocation_targets: List[int] = []
 
-        # Fine-grained blocking flags (useful if you want crash to only partially block)
+        # Fine-grained blocking flags
         self.crash_block_prepares: bool = False
         self.crash_block_commits: bool = False
         self.crash_block_replies: bool = False
         self.crash_block_newview: bool = False
 
-    # -------------------------
-    # parsing & configuring
-    # -------------------------
     def configure_from_attack_string(self, attack_str: str, all_live_nodes: List[int]):
         """
         Parse attack string and configure attacks.
@@ -72,7 +68,6 @@ class AttackConfig:
             if pl == "crash":
                 self.is_byzantine = True
                 self.crash_attack = True
-                # By default crash fully disables outgoing protocol actions
                 self.crash_block_prepares = True
                 self.crash_block_commits = True
                 self.crash_block_replies = True
@@ -101,7 +96,6 @@ class AttackConfig:
                 if targets:
                     self.dark_targets = set(targets)
                 else:
-                    # empty explicit list means no targets; interpret as "drop to none"
                     self.dark_targets = set()
 
             elif pl.startswith("equivocation"):
@@ -111,7 +105,6 @@ class AttackConfig:
                 self.equivocation_targets = targets if targets else []
 
             else:
-                # fallback / fuzzy parse
                 if "crash" in pl:
                     self.is_byzantine = True
                     self.crash_attack = True
@@ -141,9 +134,6 @@ class AttackConfig:
         nums = re.findall(r'n(\d+)', content)
         return [int(n) for n in nums]
 
-    # -------------------------
-    # serialization helpers
-    # -------------------------
     def to_dict(self) -> Dict[str, Any]:
         """Serialize AttackConfig to a JSON-friendly dict."""
         return {
@@ -183,10 +173,6 @@ class AttackConfig:
         ac.crash_block_newview = bool(data.get("crash_block_newview", False))
         return ac
 
-
-    # -------------------------
-    # query methods used by Node
-    # -------------------------
     def should_drop_message_to(self, target_node: int) -> bool:
         """Return True if messages to the target_node should be dropped (dark attack)."""
         if not self.dark_attack:
@@ -265,6 +251,10 @@ class AttackConfig:
         if self.equivocation_attack:
             parts.append(f"equivocation({','.join('n'+str(x) for x in self.equivocation_targets)})")
         return f"AttackConfig(node={self.node_id}, byzantine={self.is_byzantine}, attacks={';'.join(parts)})"
+    
+    def should_send_preprepare_only(self) -> bool:
+        """In crash attack, node only sends pre-prepare, nothing else."""
+        return bool(self.crash_attack)
 
 
 class AttackOrchestrator:
@@ -288,16 +278,6 @@ class AttackOrchestrator:
                 continue
             attack_str = attack_strings[i] if i < len(attack_strings) else ""
             self.configs[nid].configure_from_attack_string(attack_str, live_nodes)
-
-        # Print summary
-        print("\n=== Attack Configuration ===")
-        for nid in sorted(self.configs.keys()):
-            cfg = self.configs[nid]
-            if cfg.is_byzantine:
-                print(" ", cfg)
-        if not any(cfg.is_byzantine for cfg in self.configs.values()):
-            print("  No Byzantine nodes configured")
-        print("============================\n")
 
     def to_serializable_map(self) -> Dict[int, Dict[str, Any]]:
         """Return a dict mapping node_id -> attack_config_dict (serializable)."""
