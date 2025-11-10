@@ -12,9 +12,6 @@ from common import (
     MSG_PREPREPARE,
     MSG_PREPARE,
     MSG_COMMIT,
-    MSG_REPLY,
-    MSG_EXECUTE,
-    leader_for_view,
 )
 from attacks import get_attack_config, get_orchestrator, AttackConfig
 

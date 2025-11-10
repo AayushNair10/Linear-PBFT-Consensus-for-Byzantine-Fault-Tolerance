@@ -1,7 +1,5 @@
-# common.py - FIXED VERSION
-"""
-Common constants & helpers used across the PBFT simulator.
-"""
+# Common constants & helpers used across the PBFT simulator.
+
 
 # PBFT message type constants
 MSG_REQUEST = "REQUEST"
@@ -18,16 +16,12 @@ MSG_COMMIT_MULTICAST = "COMMIT_MULTICAST"
 MSG_VIEW_CHANGE = "VIEW_CHANGE"
 MSG_NEW_VIEW = "NEW_VIEW"
 MSG_RESET = "RESET"
+MSG_CHECKPOINT = "CHECKPOINT"
 
 DEFAULT_N = 7
 
-def leader_for_view(view: int, n: int = DEFAULT_N) -> int:
-    """
-    Primary selection for view.
-
-    IMPORTANT: This must be consistent across all files.
-    Formula: primary = (view % n) + 1
-    """
+def leader_for_view(view: int, n: int = DEFAULT_N) -> int: 
+    # Formula: primary = (view % n) + 1
     if n <= 0:
         n = DEFAULT_N
     return (view % n) + 1

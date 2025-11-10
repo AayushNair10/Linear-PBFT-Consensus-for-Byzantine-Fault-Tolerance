@@ -405,3 +405,4 @@ def handle_get_new_view(node, envelope: Dict[str, Any]):
         reply_queue.put(response)
     except Exception:
         pass
+

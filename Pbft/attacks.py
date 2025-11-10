@@ -1,19 +1,3 @@
-# attacks.py
-"""
-Byzantine attack implementations for PBFT simulator.
-
-Attacks supported:
-- sign: Invalid signatures
-- crash: Simulated node crash (node behaves as if down)
-- dark: Selective message dropping to specific targets
-- time: Message delays (leader waits extra before multicasting)
-- equivocation: Conflicting pre-prepares to different backups
-
-This file also provides serialization helpers so the driver can send a
-serializable attack map to each node process (spawned), which reconstructs a
-local AttackConfig per node.
-"""
-
 import time
 import random
 import re
@@ -21,7 +5,7 @@ from typing import Dict, List, Any, Optional, Set
 
 
 class AttackConfig:
-    """Configuration for Byzantine attacks on a node."""
+    #Configuration for Byzantine attacks on a node
 
     def __init__(self, node_id: int):
         self.node_id = int(node_id)
@@ -48,17 +32,7 @@ class AttackConfig:
         self.crash_block_newview: bool = False
 
     def configure_from_attack_string(self, attack_str: str, all_live_nodes: List[int]):
-        """
-        Parse attack string and configure attacks.
-
-        Examples:
-            "crash"
-            "sign"
-            "dark(n6)"
-            "time"
-            "equivocation(n6, n7)"
-            "time(1500); dark(n6)"
-        """
+        #Parse attack string and configure attacks
         if not attack_str:
             return
 
@@ -126,7 +100,6 @@ class AttackConfig:
                         self.time_delay_ms = 1000.0
 
     def _parse_node_list(self, s: str) -> List[int]:
-        """Extract n<num> occurrences from parentheses."""
         match = re.search(r'\((.*?)\)', s)
         if not match:
             return []
@@ -135,7 +108,7 @@ class AttackConfig:
         return [int(n) for n in nums]
 
     def to_dict(self) -> Dict[str, Any]:
-        """Serialize AttackConfig to a JSON-friendly dict."""
+        # Serialize AttackConfig to a JSON-friendly dict
         return {
             "node_id": self.node_id,
             "is_byzantine": self.is_byzantine,
@@ -155,7 +128,6 @@ class AttackConfig:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "AttackConfig":
-        """Reconstruct AttackConfig from a dict produced by to_dict()."""
         nid = int(data.get("node_id", 0))
         ac = cls(nid)
         ac.is_byzantine = bool(data.get("is_byzantine", False))
@@ -174,42 +146,42 @@ class AttackConfig:
         return ac
 
     def should_drop_message_to(self, target_node: int) -> bool:
-        """Return True if messages to the target_node should be dropped (dark attack)."""
+        #(dark attack)
         if not self.dark_attack:
             return False
         return target_node in self.dark_targets
 
     def apply_time_delay(self):
-        """If time attack enabled, sleep for configured milliseconds (per-phase)."""
+        #If time attack enabled, sleep for configured milliseconds
         if self.time_attack and self.time_delay_ms and self.time_delay_ms > 0:
             time.sleep(self.time_delay_ms / 1000.0)
 
     def should_block_prepare(self, is_leader: bool) -> bool:
-        """Return True if this node should block sending PREPARE messages (crash semantics)."""
+        #crash semantics
         if not self.crash_attack:
             return False
         return self.crash_block_prepares
 
     def should_block_commit(self, is_leader: bool) -> bool:
-        """Return True if this node should block sending COMMIT messages."""
+        #Return True if this node should block sending COMMIT messages
         if not self.crash_attack:
             return False
         return self.crash_block_commits
 
     def should_block_reply(self) -> bool:
-        """Return True if this node should block sending REPLY to clients."""
+        #Return True if this node should block sending REPLY to clients
         if not self.crash_attack:
             return False
         return self.crash_block_replies
 
     def should_block_newview(self) -> bool:
-        """Return True if this node (primary) should not form/multicast NEW_VIEW."""
+        # Return True if this node (primary) should not form/multicast NEW_VIEW.
         if not self.crash_attack:
             return False
         return self.crash_block_newview
 
     def corrupt_signature(self, authenticator: Dict[int, str]) -> Dict[int, str]:
-        """Corrupt signatures (simple perturbation) if sign attack active."""
+        # Corrupt signatures if sign attack active
         if not self.sign_attack:
             return authenticator
         corrupted = {}
@@ -224,7 +196,7 @@ class AttackConfig:
         return corrupted
 
     def get_equivocation_sequence(self, base_seq: int, target_node: int) -> Optional[int]:
-        """Return alternate seq for equivocation targets (base_seq + 1), else None."""
+        # Return alternate seq for equivocation targets (base_seq + 1), else None
         if not self.equivocation_attack:
             return None
         if target_node in self.equivocation_targets:
@@ -232,7 +204,7 @@ class AttackConfig:
         return None
 
     def is_crash(self) -> bool:
-        """Convenience: is this node configured to crash (driver should PAUSE it)?"""
+        # Is this node configured to crash (driver should PAUSE it)
         return bool(self.crash_attack)
 
     def __repr__(self):
@@ -258,8 +230,6 @@ class AttackConfig:
 
 
 class AttackOrchestrator:
-    """Manage AttackConfig for all nodes."""
-
     def __init__(self, num_nodes: int):
         self.num_nodes = num_nodes
         self.configs: Dict[int, AttackConfig] = {}
@@ -267,7 +237,7 @@ class AttackOrchestrator:
             self.configs[nid] = AttackConfig(nid)
 
     def configure_set(self, live_nodes: List[int], byzantine_nodes: List[int], attack_strings: List[str]):
-        """Configure each byzantine node from attack_strings (parallel lists)."""
+        
         # Reset all
         for nid in range(1, self.num_nodes + 1):
             self.configs[nid] = AttackConfig(nid)
